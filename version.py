@@ -17,11 +17,36 @@ VERSION BUMPING RULES
 __all__ = ["APP_VERSION", "APP_NAME", "CHANGELOG"]
 
 APP_NAME = "CrimsonForge"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 # Each entry: (version, date, list_of_changes)
 # Newest first. `date` is YYYY-MM-DD.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
+    (
+        "1.8.0", "2026-04-01", [
+            # ── PAC Mesh Parser (complete rewrite) ──
+            "[Feature] PAC mesh parser fully reverse-engineered from binary analysis — correct geometry for all character meshes",
+            "[Feature] PAC section layout auto-detected from section offset table inside section 0 — works for all format variants",
+            "[Feature] PAC vertex data: uint16 quantized positions dequantized with per-submesh bounding box",
+            "[Feature] PAC index buffer: triangle list format with per-submesh index counts per LOD level",
+            "[Feature] PAC multi-LOD support: LOD0 (highest quality) automatically selected for preview and export",
+            "[Feature] PAC multi-submesh support: sword blades, guards, handles, accessories parsed as separate objects",
+            "[Feature] PAC bone index padding: odd bone counts padded to even byte boundary (fixes facial/head meshes)",
+            "[Feature] PAC auto-detect vertex stride from section size — handles 36, 38, 40, 42+ byte strides",
+            "[Feature] PAC idx_count validation: stops reading at garbage values to prevent buffer overruns",
+            "[Feature] UV coordinates extracted from float16 values in vertex records",
+
+            # ── Explorer Export Fixes ──
+            "[Fix] Export context menu now uses right-clicked row instead of selected row — no more exporting wrong file",
+            "[Fix] Export output filenames include full path (e.g. character_warrior_body.obj) — no more overwrites",
+            "[Fix] Lambda closure in export menu binds entry by value — prevents stale reference issues",
+
+            # ── Format Compatibility ──
+            "[Feature] 3-LOD PAC files (cd_pgw_* heads, eyebrows) now parse correctly alongside 4-LOD files",
+            "[Feature] Variable section size encoding handled: u64 pairs, consecutive u32s, and mixed layouts",
+            "[Feature] Unsupported PAC variants (skinnedmesh_box v4.3) gracefully skip instead of showing errors",
+        ],
+    ),
     (
         "1.7.0", "2026-03-31", [
             # ── Localization Tracer ──

@@ -754,302 +754,279 @@ def parse_pamlod(data: bytes, filename: str = "", lod_level: int = 0) -> ParsedM
 # ── PAC Parser (skinned mesh) ────────────────────────────────────────
 
 def parse_pac(data: bytes, filename: str = "") -> ParsedMesh:
-    """Parse a .pac skinned character mesh (PAR v9.3.1 format).
+    """Parse a .pac skinned character mesh.
 
-    PAC format (reverse-engineered):
+    PAC format (reverse-engineered from binary analysis):
       Header: 80 bytes
         [0x00] 4B: 'PAR ' magic
-        [0x04] 4B: version (0x01000903 = v9.3.1)
-        [0x08] 8B: timestamp/hash
-        [0x10] 4B: always 0
-        [0x14] 8B: section 0 size (metadata + vertex positions + bone weights)
-        [0x1C] 8B: section 1 size
-        [0x24] 8B: section 2 size
-        [0x2C] 8B: section 3 size
-        [0x34] 8B: section 4 size (index buffer for triangle strips)
+        [0x04] 4B: version (0x01000903)
+        [0x10] 4B: zero
+        [0x14] N×8B or N×4B: section sizes (u64 or u32, variable count)
 
-      Section 0 (at offset 80):
-        - Section offset table
-        - Asset name strings
-        - Vertex data: stream of [float3 position] [float3 normal] [bone_id]
-          with FFFFFFFF separating vertices and FFFFFFFE in a second pass
-        - Bone transform data
+      Section 0: Metadata
+        - u32 flags, u8 n_lods
+        - n_lods × u32: section start offsets (LOD0 first)
+        - n_lods × u32: vertex/index split offsets per section
+        - Per submesh descriptor:
+            [u8 len][mesh_name] [u8 len][mat_name]
+            [u8 flag][2B pad] [8 floats: pivot(2) + bbox(6)]
+            [u8 bone_count][bone_indices...]
+            [n_lods × u16: vert counts] [n_lods × u32: idx counts]
 
-      Section 4 (last section):
-        - Index buffer: triangle strips with 0xFFFF restart markers
+      Sections 1..N: LOD levels (1=lowest, N=highest/LOD0)
+        Part A: 40-byte vertex records (up to split offset)
+        Part B: uint16 triangle list indices (after split offset)
 
-    Vertices are stored as float32 triplets in section 0, interleaved with
-    bone indices (uint32 < 500) and terminated by 0xFFFFFFFF markers.
+      40-byte vertex record:
+        [0-5]  3×uint16: quantized XYZ position
+        [6-7]  uint16: packed data (normal/tangent)
+        [8-11] 2×float16: UV coordinates
+        [12-15] constant (0x3C000000)
+        [16-19] 4 bytes data
+        [20-27] zeros
+        [28-31] bone index bytes (0xFF=none)
+        [32-35] bone weight bytes
+        [36-39] FFFFFFFF terminator
+
+      Per-submesh bounding box for dequantization:
+        bbox_min = (float[2], float[3], float[4])
+        bbox_max = (float[5], float[6], float[7])
+        pivot    = (float[0], float[1])  (bone attachment point)
     """
     if len(data) < 0x50 or data[:4] != PAR_MAGIC:
         raise ValueError(f"Not a valid PAC file: bad magic {data[:4]!r}")
 
     result = ParsedMesh(path=filename, format="pac")
 
-    # Read section sizes from header — try uint64 first, then uint32
-    sec_sizes = []
+    # ── Parse section layout using section offset table in section 0 ──
+    # Section 0 always starts at byte 80. Its first bytes contain:
+    #   [u32 flags] [u8 n_lods] [n_lods × u32 section_offsets] [n_lods × u32 split_offsets]
+    # Section offsets are absolute file positions (LOD0 first = largest, descending).
+    # This is the most reliable way to determine section boundaries.
     header_size = 80
 
-    # Try uint64 layout: 5 × 8 bytes at 0x14-0x3B
-    for off in range(0x14, 0x3C, 8):
-        sec_sizes.append(struct.unpack_from("<Q", data, off)[0])
-    total_sec = sum(sec_sizes)
-
-    if abs(total_sec + header_size - len(data)) > 100:
-        # Try uint32 layout: 5 × 4 bytes at 0x14-0x27, header = 40 bytes
-        sec_sizes = []
-        for off in range(0x14, 0x28, 4):
-            sec_sizes.append(struct.unpack_from("<I", data, off)[0])
-        total_sec = sum(sec_sizes)
-        header_size = 40
-
-    if abs(total_sec + header_size - len(data)) > 100:
-        # Try 10 × uint32 at 0x14 (some files have more sections)
-        sec_sizes = []
-        for off in range(0x14, 0x3C, 4):
-            sec_sizes.append(struct.unpack_from("<I", data, off)[0])
-        total_sec = sum(sec_sizes)
-        header_size = 0x3C
-
-    if abs(total_sec + header_size - len(data)) > 100:
-        # Nothing matched — fall back to vertex scan on entire file
-        logger.debug("PAC %s: section layout unknown, scanning full file", filename)
-        sec_sizes = [len(data) - 0x50]
-        header_size = 0x50
-
-    sec0_off = header_size
-    sec0_size = sec_sizes[0] if sec_sizes else len(data) - header_size
-
-    # ── Extract vertex positions from section 0 ──
-    # Scan for float3 triplets separated by FFFFFFFF terminators
-    verts, bones_per_vert = _pac_extract_vertices(data, sec0_off, sec0_size)
-
-    if not verts:
-        logger.debug("PAC %s: no vertices found in section 0, trying PAM fallback", filename)
+    if len(data) < header_size + 5:
         return _pac_fallback_pam(data, filename)
 
-    # Compute bounding box from extracted vertices
-    if verts:
-        xs = [v[0] for v in verts]
-        ys = [v[1] for v in verts]
-        zs = [v[2] for v in verts]
-        result.bbox_min = (min(xs), min(ys), min(zs))
-        result.bbox_max = (max(xs), max(ys), max(zs))
+    s0_start = header_size
+    off = s0_start
+    flags = struct.unpack_from("<I", data, off)[0]
+    n_lods = data[off + 4]
+    off += 5
 
-    # ── Extract faces from the last section (triangle strips) ──
-    last_sec_size = sec_sizes[-1]
-    last_sec_off = len(data) - last_sec_size
-    faces = _pac_extract_faces_from_strips(data, last_sec_off, last_sec_size, len(verts))
+    if n_lods == 0 or n_lods > 10:
+        return _pac_fallback_pam(data, filename)
 
-    # Find asset name for the submesh
-    mat_name = _pac_extract_name(data, sec0_off, sec0_size) or Path(filename).stem
+    # Read section offsets (absolute file positions, LOD0 first = descending)
+    lod_offsets = [struct.unpack_from("<I", data, off + i * 4)[0] for i in range(n_lods)]
+    off += n_lods * 4
+    # Skip split offsets (we compute splits from vertex counts)
+    off += n_lods * 4
 
-    sm = SubMesh(
-        name=mat_name,
-        material=mat_name,
-        texture="",
-        vertices=verts,
-        uvs=[],
-        faces=faces,
-        bone_indices=bones_per_vert,
-        bone_weights=[],
-        normals=_compute_smooth_normals(verts, faces),
-        vertex_count=len(verts),
-        face_count=len(faces),
-    )
-    result.submeshes.append(sm)
-    result.total_vertices = len(verts)
-    result.total_faces = len(faces)
-    result.has_bones = any(bones_per_vert)
+    # Compute section boundaries from offsets:
+    #   sec0: header_size to min(lod_offsets)
+    #   LOD sections: between sorted offsets, last one ends at file_end
+    sorted_offsets = sorted(lod_offsets)
+    boundaries = [header_size] + sorted_offsets + [len(data)]
+    sections = [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1)]
 
-    logger.info("Parsed PAC %s: %d verts, %d faces, %d bones_entries",
-                filename, len(verts), len(faces), sum(len(b) for b in bones_per_vert))
-    return result
+    # Validate: sec0 must have positive size
+    if sections[0][1] <= sections[0][0]:
+        return _pac_fallback_pam(data, filename)
 
+    s0_end = sections[0][1]
 
-def _pac_extract_vertices(data: bytes, sec_off: int, sec_size: int):
-    """Extract float32 vertex positions from PAC section 0.
-
-    Scans the section for float3 triplets interleaved with bone indices
-    and FFFFFFFF terminators.  Returns (positions, bones_per_vertex).
-    """
-    end = sec_off + sec_size
-    verts = []
-    bones_per_vert = []
-
-    # Find where vertex data starts by looking for the first valid float3
-    # after the asset name strings (skip first ~100 bytes of metadata)
-    scan_start = sec_off + 80  # skip offset table + names (approximate)
-
-    # Scan for start of vertex float stream
-    vertex_start = None
-    for off in range(scan_start, min(end - 12, sec_off + 1000)):
-        x, y, z = struct.unpack_from("<fff", data, off)
-        if (not math.isnan(x) and not math.isnan(y) and not math.isnan(z) and
-                abs(x) < 50 and abs(y) < 50 and abs(z) < 50 and
-                (abs(x) + abs(y) + abs(z)) > 0.001):
-            # Check if next 4 bytes are a bone_id or FFFFFFFF (valid successor)
-            next4 = struct.unpack_from("<I", data, off + 12)[0]
-            if next4 == 0xFFFFFFFF or next4 < 500:
-                vertex_start = off
+    # ── Find and parse submesh descriptors ──
+    # Scan forward for first length-prefixed ASCII string
+    scan = off
+    while scan < s0_end - 10:
+        b = data[scan]
+        if 4 < b < 100:
+            test = data[scan + 1:scan + 1 + b]
+            if len(test) == b and all(32 <= c < 127 for c in test):
                 break
-            # Or another float3 follows
-            nx, ny, nz = struct.unpack_from("<fff", data, off + 12)
-            if abs(nx) < 50 and abs(ny) < 50 and abs(nz) < 50:
-                vertex_start = off
+        scan += 1
+    off = scan
+
+    pac_submeshes = []
+    while off < s0_end - 20:
+        name_len = data[off]
+        if name_len == 0 or name_len > 200 or off + 1 + name_len >= s0_end:
+            break
+        mesh_name = data[off + 1:off + 1 + name_len].decode("ascii", "replace")
+        off += 1 + name_len
+        if not all(32 <= ord(c) < 127 for c in mesh_name):
+            break
+
+        mat_len = data[off]
+        mat_name = data[off + 1:off + 1 + mat_len].decode("ascii", "replace") if mat_len > 0 else ""
+        off += 1 + mat_len
+
+        # flag(1) + pad(2) + 8 floats(32) + bone data
+        off += 3
+        bbox_floats = [struct.unpack_from("<f", data, off + i * 4)[0] for i in range(8)]
+        off += 32
+
+        # Bone data: [u8 bone_count] [bone_count × u8 indices]
+        # Bone indices are padded to even byte count (odd bc gets +1 pad byte).
+        bone_count = data[off]
+        off += 1
+        bones_size = bone_count + (bone_count % 2)  # round up to even
+        off += bones_size
+
+        # Per-LOD vertex counts (n_lods × u16) + index counts (n_lods × u32)
+        # Some files have fewer idx_counts than n_lods — validate and truncate.
+        vert_counts = [struct.unpack_from("<H", data, off + i * 2)[0] for i in range(n_lods)]
+        off += n_lods * 2
+
+        idx_counts = []
+        max_reasonable_idx = 10_000_000  # no single submesh has 10M indices
+        for i in range(n_lods):
+            if off + 4 > s0_end:
                 break
-
-    if vertex_start is None:
-        return [], []
-
-    # Parse the vertex stream
-    off = vertex_start
-    current_pos = None
-    current_bones = []
-    seen_positions = {}  # (x,y,z) rounded → vertex index
-
-    while off < end - 4:
-        raw = struct.unpack_from("<I", data, off)[0]
-
-        # FFFFFFFF = end of current vertex's bone chain
-        if raw == 0xFFFFFFFF:
-            if current_pos is not None:
-                key = (round(current_pos[0], 5), round(current_pos[1], 5), round(current_pos[2], 5))
-                if key not in seen_positions:
-                    seen_positions[key] = len(verts)
-                    verts.append(current_pos)
-                    bones_per_vert.append(tuple(current_bones))
-                current_pos = None
-                current_bones = []
+            val = struct.unpack_from("<I", data, off)[0]
+            if val > max_reasonable_idx:
+                break  # hit garbage — stop reading idx_counts
+            idx_counts.append(val)
             off += 4
-            continue
+        # Pad missing LODs with 0
+        while len(idx_counts) < n_lods:
+            idx_counts.append(0)
 
-        # FFFFFFFE = second pass terminator (different semantic, treat like FFFFFFFF)
-        if raw == 0xFFFFFFFE:
-            if current_pos is not None:
-                key = (round(current_pos[0], 5), round(current_pos[1], 5), round(current_pos[2], 5))
-                if key not in seen_positions:
-                    seen_positions[key] = len(verts)
-                    verts.append(current_pos)
-                    bones_per_vert.append(tuple(current_bones))
-                current_pos = None
-                current_bones = []
-            off += 4
-            continue
+        bmin = (bbox_floats[2], bbox_floats[3], bbox_floats[4])
+        bmax = (bbox_floats[5], bbox_floats[6], bbox_floats[7])
 
-        # Small integer = bone index
-        if raw < 500:
-            current_bones.append(raw)
-            off += 4
-            continue
+        pac_submeshes.append({
+            "name": mesh_name, "material": mat_name,
+            "bmin": bmin, "bmax": bmax,
+            "vert_counts": vert_counts, "idx_counts": idx_counts,
+        })
 
-        # Also check uint16 bone index
-        val16 = struct.unpack_from("<H", data, off)[0]
-        if val16 < 500 and off + 2 <= end:
-            # Peek ahead: does a valid float3 follow at +2?
-            if off + 14 <= end:
-                fx, fy, fz = struct.unpack_from("<fff", data, off + 2)
-                if abs(fx) < 50 and abs(fy) < 50 and abs(fz) < 50 and not math.isnan(fx):
-                    current_bones.append(val16)
-                    off += 2
-                    continue
+        # Check if next byte starts another submesh name
+        if off >= s0_end - 4:
+            break
+        next_b = data[off]
+        if next_b == 0 or next_b > 200:
+            break
+        peek = data[off + 1:off + 1 + min(next_b, 6)]
+        if not all(32 <= c < 127 for c in peek):
+            break
 
-        # Try reading as float3 position
-        if off + 12 <= end:
-            x, y, z = struct.unpack_from("<fff", data, off)
-            if (not math.isnan(x) and not math.isnan(y) and not math.isnan(z) and
-                    abs(x) < 50 and abs(y) < 50 and abs(z) < 50):
-                # Valid position — this is either a new vertex or repeated position
-                if current_pos is None or (
-                    abs(x - current_pos[0]) > 0.0001 or
-                    abs(y - current_pos[1]) > 0.0001 or
-                    abs(z - current_pos[2]) > 0.0001
-                ):
-                    # New position — save previous if exists
-                    if current_pos is not None:
-                        key = (round(current_pos[0], 5), round(current_pos[1], 5), round(current_pos[2], 5))
-                        if key not in seen_positions:
-                            seen_positions[key] = len(verts)
-                            verts.append(current_pos)
-                            bones_per_vert.append(tuple(current_bones))
-                        current_bones = []
-                    current_pos = (x, y, z)
-                # else: same position repeated for another bone assignment, skip
-                off += 12
-                continue
+    if not pac_submeshes:
+        return _pac_fallback_pam(data, filename)
 
-        # Unknown data — skip 4 bytes
-        off += 4
+    # ── Extract LOD0 geometry (highest quality = last data section) ──
+    lod0_sec_start, lod0_sec_end = sections[-1]
+    lod0_sec_size = lod0_sec_end - lod0_sec_start
 
-    # Save last vertex
-    if current_pos is not None:
-        key = (round(current_pos[0], 5), round(current_pos[1], 5), round(current_pos[2], 5))
-        if key not in seen_positions:
-            verts.append(current_pos)
-            bones_per_vert.append(tuple(current_bones))
+    # Auto-detect vertex stride from section size:
+    #   section = (total_verts × stride) + (total_indices × 2)
+    #   stride = (section_size - total_indices × 2) / total_verts
+    total_lod0_verts = sum(sm["vert_counts"][0] for sm in pac_submeshes)
+    total_lod0_indices = sum(sm["idx_counts"][0] for sm in pac_submeshes)
 
-    return verts, bones_per_vert
+    if total_lod0_verts == 0:
+        return _pac_fallback_pam(data, filename)
 
+    vert_stride = (lod0_sec_size - total_lod0_indices * 2) // total_lod0_verts
+    if vert_stride < 6 or vert_stride > 128:
+        logger.debug("PAC %s: computed stride %d out of range, trying PAM fallback",
+                     filename, vert_stride)
+        return _pac_fallback_pam(data, filename)
 
-def _pac_extract_faces_from_strips(data: bytes, idx_off: int, idx_size: int, vert_count: int):
-    """Extract triangle faces from PAC triangle strip index buffer.
+    lod0_split = lod0_sec_start + total_lod0_verts * vert_stride
 
-    PAC uses triangle strips with 0xFFFF as restart markers.
-    """
-    faces = []
-    n_indices = idx_size // 2
-    strip = []
+    vert_off = lod0_sec_start
+    idx_off = lod0_split
 
-    for j in range(n_indices):
-        val = struct.unpack_from("<H", data, idx_off + j * 2)[0]
-        if val == 0xFFFF:
-            # Convert current strip to triangles
-            for k in range(len(strip) - 2):
-                a, b, c = strip[k], strip[k + 1], strip[k + 2]
-                if a != b and b != c and a != c:  # degenerate triangle check
-                    if a < vert_count and b < vert_count and c < vert_count:
-                        if k % 2 == 0:
-                            faces.append((a, b, c))
-                        else:
-                            faces.append((a, c, b))  # flip winding for odd triangles
-            strip = []
-        else:
-            if val < vert_count:
-                strip.append(val)
+    for sm_info in pac_submeshes:
+        nv = sm_info["vert_counts"][0]  # LOD0 vertex count
+        ni = sm_info["idx_counts"][0]   # LOD0 index count
+        bmin = sm_info["bmin"]
+        bmax = sm_info["bmax"]
 
-    # Process last strip
-    for k in range(len(strip) - 2):
-        a, b, c = strip[k], strip[k + 1], strip[k + 2]
-        if a != b and b != c and a != c:
-            if a < vert_count and b < vert_count and c < vert_count:
-                if k % 2 == 0:
-                    faces.append((a, b, c))
+        # Dequantize vertex positions from uint16
+        verts = []
+        uvs = []
+        for i in range(nv):
+            rec_off = vert_off + i * vert_stride
+            if rec_off + 12 > len(data):
+                break
+            xu, yu, zu = struct.unpack_from("<HHH", data, rec_off)
+            x = bmin[0] + (xu / 65535.0) * (bmax[0] - bmin[0])
+            y = bmin[1] + (yu / 65535.0) * (bmax[1] - bmin[1])
+            z = bmin[2] + (zu / 65535.0) * (bmax[2] - bmin[2])
+            verts.append((x, y, z))
+
+            # UV from float16 at bytes 8-11
+            try:
+                u = struct.unpack_from("<e", data, rec_off + 8)[0]
+                v = struct.unpack_from("<e", data, rec_off + 10)[0]
+                if not math.isnan(u) and not math.isnan(v):
+                    uvs.append((u, v))
                 else:
-                    faces.append((a, c, b))
+                    uvs.append((0.0, 0.0))
+            except Exception:
+                uvs.append((0.0, 0.0))
 
-    return faces
+        # Extract faces (triangle list, NOT strip)
+        faces = []
+        for i in range(0, ni - 2, 3):
+            if idx_off + (i + 2) * 2 + 2 > len(data):
+                break
+            a = struct.unpack_from("<H", data, idx_off + i * 2)[0]
+            b = struct.unpack_from("<H", data, idx_off + (i + 1) * 2)[0]
+            c = struct.unpack_from("<H", data, idx_off + (i + 2) * 2)[0]
+            if a < nv and b < nv and c < nv:
+                faces.append((a, b, c))
 
+        normals = _compute_smooth_normals(verts, faces)
 
-def _pac_extract_name(data: bytes, sec_off: int, sec_size: int) -> str:
-    """Extract asset name from PAC section 0."""
-    # Names start around offset 0x78 in the section (after offset table)
-    search = data[sec_off + 32:sec_off + min(sec_size, 256)]
-    for prefix in [b"CD_", b"cd_"]:
-        idx = search.find(prefix)
-        if idx >= 0:
-            start = sec_off + 32 + idx
-            end = data.find(b"\x00", start, start + 128)
-            if end > start:
-                return data[start:end].decode("ascii", "replace")
-    return ""
+        sm = SubMesh(
+            name=sm_info["name"],
+            material=sm_info["material"],
+            texture="",
+            vertices=verts,
+            uvs=uvs,
+            faces=faces,
+            normals=normals,
+            vertex_count=len(verts),
+            face_count=len(faces),
+        )
+        result.submeshes.append(sm)
+
+        vert_off += nv * vert_stride
+        idx_off += ni * 2
+
+    # Compute overall stats
+    if result.submeshes:
+        all_verts = [v for sm in result.submeshes for v in sm.vertices]
+        if all_verts:
+            xs = [v[0] for v in all_verts]
+            ys = [v[1] for v in all_verts]
+            zs = [v[2] for v in all_verts]
+            result.bbox_min = (min(xs), min(ys), min(zs))
+            result.bbox_max = (max(xs), max(ys), max(zs))
+
+    result.total_vertices = sum(len(sm.vertices) for sm in result.submeshes)
+    result.total_faces = sum(len(sm.faces) for sm in result.submeshes)
+    result.has_uvs = any(sm.uvs for sm in result.submeshes)
+
+    logger.info("Parsed PAC %s: %d submeshes, %d verts, %d faces",
+                filename, len(result.submeshes), result.total_vertices, result.total_faces)
+    return result
 
 
 def _pac_fallback_pam(data: bytes, filename: str) -> ParsedMesh:
     """Fallback: try parsing PAC as PAM (works for some small PAC files)."""
     try:
-        return parse_pam(data, filename)
+        result = parse_pam(data, filename)
+        if result.total_vertices > 0:
+            return result
     except Exception:
-        return ParsedMesh(path=filename, format="pac")
+        pass
+    logger.debug("PAC %s: unsupported format variant, skipping", filename)
+    return ParsedMesh(path=filename, format="pac")
 
 
 # ── Auto-detect and parse ────────────────────────────────────────────

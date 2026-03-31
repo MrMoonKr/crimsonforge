@@ -564,16 +564,19 @@ class ExplorerTab(QWidget):
         menu.addAction("Uncheck All").triggered.connect(lambda: self._model.check_all(False))
 
         # Mesh export options for .pam/.pamlod/.pac files
-        if rows and len(rows) == 1:
-            row_data = self._model.row_at(rows[0])
-            if row_data:
+        # Use the row at the right-click position, not the selection
+        click_index = self._view.indexAt(pos)
+        if click_index.isValid():
+            click_row_data = self._model.row_at(click_index.row())
+            if click_row_data:
                 from core.mesh_parser import is_mesh_file
-                if is_mesh_file(row_data.entry.path):
+                if is_mesh_file(click_row_data.entry.path):
                     menu.addSeparator()
+                    entry = click_row_data.entry
                     export_obj_act = menu.addAction("Export as OBJ")
-                    export_obj_act.triggered.connect(lambda: self._export_mesh(row_data.entry, "obj"))
+                    export_obj_act.triggered.connect(lambda _=False, e=entry: self._export_mesh(e, "obj"))
                     export_fbx_act = menu.addAction("Export as FBX")
-                    export_fbx_act.triggered.connect(lambda: self._export_mesh(row_data.entry, "fbx"))
+                    export_fbx_act.triggered.connect(lambda _=False, e=entry: self._export_mesh(e, "fbx"))
 
         menu.exec(self._view.viewport().mapToGlobal(pos))
 
@@ -633,7 +636,10 @@ class ExplorerTab(QWidget):
                 show_error(self, "Export Error", "No geometry found in this file.")
                 return
 
-            basename = os.path.splitext(os.path.basename(entry.path))[0]
+            # Build unique output name: include parent dirs to avoid collisions
+            # e.g. "character/warrior/body.pac" → "character_warrior_body"
+            clean_path = entry.path.replace("\\", "/")
+            basename = os.path.splitext(clean_path)[0].replace("/", "_")
 
             # Try to find matching skeleton (.pab) for PAC files
             skeleton = None
