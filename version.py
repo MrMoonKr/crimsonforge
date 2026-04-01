@@ -24,6 +24,16 @@ APP_VERSION = "1.8.0"
 CHANGELOG: list[tuple[str, str, list[str]]] = [
     (
         "1.8.0", "2026-04-01", [
+            # ── Round-Trip Mesh Modding ──
+            "[Feature] OBJ Import: load modified OBJ files back into the app for preview and patching",
+            "[Feature] PAC Builder: rebuild PAC binary from modified mesh — quantizes positions, builds vertex records and index buffer",
+            "[Feature] PAM Builder: rebuild PAM binary from modified mesh — preserves header, submesh table, and geometry layout",
+            "[Feature] Import OBJ (replace mesh): right-click any .pac/.pam/.pamlod in Explorer to import a modified OBJ",
+            "[Feature] Import OBJ + Patch to Game: one-click import, rebuild, compress, encrypt, and write to game archives",
+            "[Feature] Full round-trip pipeline: Export OBJ → edit in Blender → Import OBJ → Patch to Game",
+            "[Feature] OBJ export now embeds source_path and source_format comments for re-import identification",
+            "[Fix] FBX binary writer: child node end_offset was relative to 0 instead of absolute file position — Blender now opens FBX files correctly",
+
             # ── PAC Mesh Parser (complete rewrite) ──
             "[Feature] PAC mesh parser fully reverse-engineered from binary analysis — correct geometry for all character meshes",
             "[Feature] PAC section layout auto-detected from section offset table inside section 0 — works for all format variants",

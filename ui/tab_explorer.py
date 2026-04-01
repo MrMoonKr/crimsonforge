@@ -577,6 +577,11 @@ class ExplorerTab(QWidget):
                     export_obj_act.triggered.connect(lambda _=False, e=entry: self._export_mesh(e, "obj"))
                     export_fbx_act = menu.addAction("Export as FBX")
                     export_fbx_act.triggered.connect(lambda _=False, e=entry: self._export_mesh(e, "fbx"))
+                    menu.addSeparator()
+                    import_act = menu.addAction("Import OBJ (replace mesh)")
+                    import_act.triggered.connect(lambda _=False, e=entry: self._import_mesh(e))
+                    patch_act = menu.addAction("Import OBJ + Patch to Game")
+                    patch_act.triggered.connect(lambda _=False, e=entry: self._import_and_patch_mesh(e))
 
         menu.exec(self._view.viewport().mapToGlobal(pos))
 
@@ -694,6 +699,147 @@ class ExplorerTab(QWidget):
             logger.error("Mesh export error for %s: %s", entry.path, e)
             from ui.dialogs.confirmation import show_error
             show_error(self, "Export Error", str(e))
+
+    def _import_mesh(self, entry: PamtFileEntry):
+        """Import an OBJ file to replace a mesh, preview the result."""
+        from ui.dialogs.file_picker import pick_file
+        obj_path = pick_file(self, "Select OBJ File", filters="OBJ Files (*.obj);;All Files (*.*)")
+        if not obj_path:
+            return
+
+        try:
+            self._progress.set_status(f"Importing {os.path.basename(obj_path)}...")
+
+            from core.mesh_importer import import_obj, build_mesh
+            imported = import_obj(obj_path)
+
+            if not imported.submeshes:
+                show_error(self, "Import Error", "No geometry found in OBJ file.")
+                return
+
+            # Read original data for rebuild
+            original_data = self._vfs.read_entry_data(entry)
+
+            # Override source info from the target entry
+            imported.path = entry.path
+            ext = os.path.splitext(entry.path.lower())[1]
+            imported.format = "pac" if ext == ".pac" else "pamlod" if ext == ".pamlod" else "pam"
+
+            # Build new binary
+            new_data = build_mesh(imported, original_data)
+
+            # Preview the rebuilt mesh
+            basename = os.path.basename(entry.path)
+            temp_path = os.path.join(self._temp_dir, basename)
+            with open(temp_path, "wb") as f:
+                f.write(new_data)
+            self._preview.preview_file(temp_path)
+
+            # Store for potential patching
+            self._pending_mesh_data = {
+                "entry": entry,
+                "new_data": new_data,
+                "imported": imported,
+            }
+
+            self._progress.set_status(
+                f"Imported: {imported.total_vertices:,} verts, "
+                f"{imported.total_faces:,} faces, {len(new_data):,} bytes. "
+                f"Right-click > 'Import OBJ + Patch to Game' to apply."
+            )
+            show_info(self, "Import Complete",
+                      f"Imported {os.path.basename(obj_path)}\n\n"
+                      f"Vertices: {imported.total_vertices:,}\n"
+                      f"Faces: {imported.total_faces:,}\n"
+                      f"Submeshes: {len(imported.submeshes)}\n"
+                      f"New size: {len(new_data):,} bytes\n\n"
+                      f"Use 'Import OBJ + Patch to Game' to write to game files.")
+
+        except Exception as e:
+            self._progress.set_status(f"Import error: {e}")
+            logger.error("Mesh import error for %s: %s", entry.path, e)
+            show_error(self, "Import Error", str(e))
+
+    def _import_and_patch_mesh(self, entry: PamtFileEntry):
+        """Import OBJ, rebuild binary, and patch directly into the game."""
+        from ui.dialogs.file_picker import pick_file
+        obj_path = pick_file(self, "Select OBJ File", filters="OBJ Files (*.obj);;All Files (*.*)")
+        if not obj_path:
+            return
+
+        try:
+            self._progress.set_status(f"Importing and patching {os.path.basename(obj_path)}...")
+
+            from core.mesh_importer import import_obj, build_mesh
+            imported = import_obj(obj_path)
+
+            if not imported.submeshes:
+                show_error(self, "Import Error", "No geometry found in OBJ file.")
+                return
+
+            # Read original data
+            original_data = self._vfs.read_entry_data(entry)
+
+            # Set format from target entry
+            imported.path = entry.path
+            ext = os.path.splitext(entry.path.lower())[1]
+            imported.format = "pac" if ext == ".pac" else "pamlod" if ext == ".pamlod" else "pam"
+
+            # Build new binary
+            new_data = build_mesh(imported, original_data)
+
+            # Confirm with user
+            if not confirm_action(self, "Patch to Game",
+                                  f"Replace {entry.path} in game?\n\n"
+                                  f"Original: {len(original_data):,} bytes\n"
+                                  f"New: {len(new_data):,} bytes\n"
+                                  f"Vertices: {imported.total_vertices:,}\n"
+                                  f"Faces: {imported.total_faces:,}\n\n"
+                                  f"A backup will be created automatically."):
+                return
+
+            # Repack using the existing engine
+            from core.repack_engine import RepackEngine, ModifiedFile
+            game_path = os.path.dirname(os.path.dirname(entry.paz_file))
+            papgt_path = os.path.join(game_path, "meta", "0.papgt")
+
+            # Find which package group this entry belongs to
+            paz_dir = os.path.basename(os.path.dirname(entry.paz_file))
+
+            # Load PAMT data for this group
+            pamt_data = self._vfs.load_pamt(paz_dir)
+
+            mod_file = ModifiedFile(
+                data=new_data,
+                entry=entry,
+                pamt_data=pamt_data,
+                package_group=paz_dir,
+            )
+
+            engine = RepackEngine(game_path)
+            result = engine.repack(
+                [mod_file], papgt_path=papgt_path,
+                create_backup=True, verify_after=True,
+            )
+
+            if result.success:
+                self._progress.set_status(
+                    f"Patched {entry.path}: {imported.total_vertices:,} verts, "
+                    f"{imported.total_faces:,} faces"
+                )
+                show_info(self, "Patch Complete",
+                          f"Successfully patched {entry.path}\n\n"
+                          f"Vertices: {imported.total_vertices:,}\n"
+                          f"Faces: {imported.total_faces:,}\n"
+                          f"Size: {len(new_data):,} bytes\n\n"
+                          f"Launch the game to see your changes!")
+            else:
+                show_error(self, "Patch Error", f"Repack failed: {result.error}")
+
+        except Exception as e:
+            self._progress.set_status(f"Patch error: {e}")
+            logger.error("Mesh patch error for %s: %s", entry.path, e)
+            show_error(self, "Patch Error", str(e))
 
     def _open_archive_in_editor(self, entry: PamtFileEntry):
         try:

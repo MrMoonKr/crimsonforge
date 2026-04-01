@@ -59,6 +59,8 @@ def export_obj(mesh: ParsedMesh, output_dir: str, name: str = "",
         f"# Crimson Desert Mesh — {base}",
         f"# {len(mesh.submeshes)} submesh(es), {mesh.total_vertices} verts, {mesh.total_faces} faces",
         f"# Exported by CrimsonForge",
+        f"# source_path: {mesh.path}",
+        f"# source_format: {mesh.format}",
         f"mtllib {os.path.basename(mtl_path)}",
         "",
     ]
@@ -200,33 +202,41 @@ def _fbx_prop(v):
 
 
 def _fbx_node(buf: io.BytesIO, name: str, props=None, children=None):
-    """Write an FBX binary node."""
+    """Write an FBX binary node with correct absolute end offsets.
+
+    Uses placeholder + patch approach: writes a placeholder end_offset,
+    then patches it after all children are written to the same buffer.
+    """
     nb = name.encode("ascii")
     props = props or []
     children = children or []
 
-    # Properties
+    # Serialize properties
     pb = io.BytesIO()
     for p in props:
         pb.write(_fbx_prop(p))
     pb = pb.getvalue()
 
-    # Children
-    cb = io.BytesIO()
-    for child_fn in children:
-        child_fn(cb)
-    if children:
-        cb.write(b"\x00" * 13)  # null terminator node
-    cb = cb.getvalue()
-
-    end = buf.tell() + 13 + len(nb) + len(pb) + len(cb)
-    buf.write(struct.pack("<I", end))
+    # Write node header with placeholder end_offset
+    end_pos_loc = buf.tell()  # remember where end_offset is stored
+    buf.write(struct.pack("<I", 0))  # placeholder — patched below
     buf.write(struct.pack("<I", len(props)))
     buf.write(struct.pack("<I", len(pb)))
     buf.write(struct.pack("B", len(nb)))
     buf.write(nb)
     buf.write(pb)
-    buf.write(cb)
+
+    # Write children directly to the SAME buffer (so offsets are absolute)
+    for child_fn in children:
+        child_fn(buf)
+    if children:
+        buf.write(b"\x00" * 13)  # null terminator node
+
+    # Patch the end_offset with the actual current position
+    end_offset = buf.tell()
+    buf.seek(end_pos_loc)
+    buf.write(struct.pack("<I", end_offset))
+    buf.seek(end_offset)  # restore position
 
 
 def export_fbx(mesh: ParsedMesh, output_dir: str, name: str = "",
