@@ -27,6 +27,7 @@ CHANGELOG: list[tuple[str, str, list[str]]] = [
             "[Fix] OBJ reimport now preserves the real face-level UV and normal index mapping from Blender exports instead of assuming position, UV, and normal indices always match",
             "[Fix] Mesh import now correctly splits reused vertices when one position is referenced with multiple UV or normal combinations, preventing mixed, floating, or scrambled textures after reimport",
             "[Fix] The Blender OBJ texture/material binding issue applies across PAC, PAM, and PAMLOD OBJ reimport workflows because the core importer now rebuilds vertices from the actual vi/ti/ni tuples",
+            "[Hotfix] Full PAM topology rebuild now remaps hidden static-mesh donor payload by aligned spatial vertex matching instead of raw vertex index, reducing black shading and material corruption on edited static meshes with added geometry",
             "[Feature] Item Catalog tab added: browse raw live-game item data with deep category, subcategory, and subtype taxonomy, searchable tables, path filters, and detailed record inspection",
             "[Feature] Item Catalog exports added: generate enriched CSV/JSON catalogs from iteminfo, multichange, equip-type, slot, and related raw game tables directly from the installed game packages",
             "[Feature] Dialogue Catalog was rebuilt into an enterprise browser with Story, Speakers, and Families views, ordered conversation transcripts, search, filtering, and speaker-confidence reporting",
