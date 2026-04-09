@@ -601,6 +601,31 @@ class AudioTab(QWidget):
         self._omnivoice_class_temp.setSingleStep(0.1)
         self._omnivoice_class_temp.setValue(float(self._config.get("tts.omnivoice_class_temperature", 0.0)))
         adv_form.addRow("Class Temp:", self._omnivoice_class_temp)
+
+        self._omnivoice_gender = QComboBox()
+        self._omnivoice_gender.addItems(['Auto', 'Male / 男', 'Female / 女'])
+        self._omnivoice_gender.setStyleSheet(combo_style)
+        adv_form.addRow("Gender:", self._omnivoice_gender)
+
+        self._omnivoice_age = QComboBox()
+        self._omnivoice_age.addItems(['Auto', 'Child / 儿童', 'Teenager / 少年', 'Young Adult / 青年', 'Middle-aged / 中年', 'Elderly / 老年'])
+        self._omnivoice_age.setStyleSheet(combo_style)
+        adv_form.addRow("Age:", self._omnivoice_age)
+
+        self._omnivoice_pitch = QComboBox()
+        self._omnivoice_pitch.addItems(['Auto', 'Very Low Pitch / 极低音调', 'Low Pitch / 低音调', 'Moderate Pitch / 中音调', 'High Pitch / 高音调', 'Very High Pitch / 极高音调'])
+        self._omnivoice_pitch.setStyleSheet(combo_style)
+        adv_form.addRow("Pitch:", self._omnivoice_pitch)
+
+        self._omnivoice_style = QComboBox()
+        self._omnivoice_style.addItems(['Auto', 'Whisper / 耳语'])
+        self._omnivoice_style.setStyleSheet(combo_style)
+        adv_form.addRow("Style:", self._omnivoice_style)
+
+        self._omnivoice_accent = QComboBox()
+        self._omnivoice_accent.addItems(['Auto', 'American Accent / 美式口音', 'Australian Accent / 澳大利亚口音', 'British Accent / 英国口音', 'Chinese Accent / 中国口音', 'Canadian Accent / 加拿大口音', 'Indian Accent / 印度口音', 'Korean Accent / 韩国口音', 'Portuguese Accent / 葡萄牙口音', 'Russian Accent / 俄罗斯口音', 'Japanese Accent / 日本口音'])
+        self._omnivoice_accent.setStyleSheet(combo_style)
+        adv_form.addRow("English Accent:", self._omnivoice_accent)
         rl.addWidget(self._omnivoice_advanced_group)
 
         rl.addWidget(QLabel("Text:"))
@@ -786,6 +811,11 @@ class AudioTab(QWidget):
         self._config.set("tts.omnivoice_clone_mode", self._omnivoice_mode.currentData() or "one_shot")
         self._config.set("tts.omnivoice_profile_name", self._omnivoice_profile_name.text().strip())
         self._config.set("tts.omnivoice_refresh_profile", self._omnivoice_refresh_profile.isChecked())
+        self._config.set("tts.omnivoice_gender", self._omnivoice_gender.currentText())
+        self._config.set("tts.omnivoice_age", self._omnivoice_age.currentText())
+        self._config.set("tts.omnivoice_pitch", self._omnivoice_pitch.currentText())
+        self._config.set("tts.omnivoice_style", self._omnivoice_style.currentText())
+        self._config.set("tts.omnivoice_accent", self._omnivoice_accent.currentText())
 
     def _apply_omnivoice_ui_state(self):
         mode = self._config.get("tts.omnivoice_clone_mode", "one_shot")
@@ -795,6 +825,11 @@ class AudioTab(QWidget):
                 break
         self._omnivoice_profile_name.setText(self._config.get("tts.omnivoice_profile_name", ""))
         self._omnivoice_refresh_profile.setChecked(bool(self._config.get("tts.omnivoice_refresh_profile", True)))
+        self._omnivoice_gender.setCurrentText(self._config.get("tts.omnivoice_gender", "Auto"))
+        self._omnivoice_age.setCurrentText(self._config.get("tts.omnivoice_age", "Auto"))
+        self._omnivoice_pitch.setCurrentText(self._config.get("tts.omnivoice_pitch", "Auto"))
+        self._omnivoice_style.setCurrentText(self._config.get("tts.omnivoice_style", "Auto"))
+        self._omnivoice_accent.setCurrentText(self._config.get("tts.omnivoice_accent", "Auto"))
 
     def _refresh_provider_specific_ui(self):
         is_omni = self._is_omnivoice_provider()
@@ -1298,6 +1333,11 @@ class AudioTab(QWidget):
             "t_shift": self._omnivoice_t_shift.value(),
             "position_temperature": self._omnivoice_position_temp.value(),
             "class_temperature": self._omnivoice_class_temp.value(),
+            "param_9": self._omnivoice_gender.currentText(),
+            "param_10": self._omnivoice_age.currentText(),
+            "param_11": self._omnivoice_pitch.currentText(),
+            "param_12": self._omnivoice_style.currentText(),
+            "param_13": self._omnivoice_accent.currentText(),
             "response_format": "wav",
             "stream": False,
         }
