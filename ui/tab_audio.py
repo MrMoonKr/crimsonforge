@@ -366,10 +366,11 @@ class AudioTab(QWidget):
         self._view.verticalHeader().setVisible(False)
         self._view.verticalHeader().setDefaultSectionSize(22)
         self._view.horizontalHeader().setSectionResizeMode(_COL_FILE, QHeaderView.Interactive)
-        self._view.horizontalHeader().setSectionResizeMode(_COL_TEXT, QHeaderView.Stretch)
+        self._view.horizontalHeader().setSectionResizeMode(_COL_TEXT, QHeaderView.Interactive)
         self._view.setColumnWidth(_COL_FILE, 280)
         self._view.setColumnWidth(_COL_LANG, 40)
         self._view.setColumnWidth(_COL_CATEGORY, 120)
+        self._view.setColumnWidth(_COL_TEXT, 400)
         self._view.setColumnWidth(_COL_SIZE, 60)
         self._view.setColumnWidth(_COL_NPC, 140)
         self._view.setColumnWidth(_COL_LOCATION, 500)
@@ -900,23 +901,8 @@ class AudioTab(QWidget):
 
             self._text_display.setPlainText("\n".join(lines))
 
-            # Auto-load text into TTS input — use the selected TTS language if available
-            tts_lang = self._tts_lang.currentText().strip()
-            tts_lang_code = tts_lang.split("-")[0].lower() if tts_lang else ""
-            tts_text = ""
-            if ae.text_translations and tts_lang_code:
-                # Try exact match first (e.g. "ar"), then try with region (e.g. "ar-sa")
-                tts_text = ae.text_translations.get(tts_lang_code, "")
-                if not tts_text:
-                    # Try matching lang codes like "es" matching "es-mx"
-                    for lk, lv in ae.text_translations.items():
-                        if lk.startswith(tts_lang_code):
-                            tts_text = lv
-                            break
-            if not tts_text:
-                tts_text = ae.text_original
-            if tts_text:
-                self._tts_text.setPlainText(tts_text)
+            # Manual entry for generation prompt preferred by user
+            # Main prompt (_tts_text) remains empty for user input
 
             self._autofill_omnivoice_context(ae)
 
@@ -1182,6 +1168,11 @@ class AudioTab(QWidget):
         try:
             path = self._ensure_reference_audio_for_entry(ae)
             self._omnivoice_ref_audio.setText(path)
+            
+            # Force auto-fill reference transcript from display or entry
+            ref_text = self._build_tts_text_for_entry(ae)
+            self._omnivoice_ref_text.setPlainText(ref_text)
+                
             self._autofill_omnivoice_context(ae)
             self._progress.set_status(f"Reference ready: {os.path.basename(path)}")
         except Exception as e:
@@ -1224,6 +1215,10 @@ class AudioTab(QWidget):
                 self._omnivoice_ref_audio.setText(self._ensure_reference_audio_for_entry(ae))
             except Exception:
                 pass
+        
+        # Sync reference transcript with current selection
+        self._omnivoice_ref_text.setPlainText(self._build_tts_text_for_entry(ae) or "")
+
         if not self._omnivoice_profile_name.text().strip():
             self._omnivoice_profile_name.setText(self._suggest_omnivoice_profile_name(ae))
         if not (self._voice_combo.currentText() or "").strip():
