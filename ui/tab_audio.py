@@ -154,6 +154,7 @@ class _AudioModel(QAbstractTableModel):
         self._filtered: list[int] = []
         self._cat_filter = ""
         self._lang_filter = ""
+        self._ext_filter = "" # NEW: Extension filter
         self._search = ""
 
     def set_data(self, entries: list[AudioEntry]):
@@ -162,10 +163,11 @@ class _AudioModel(QAbstractTableModel):
         self._refilter()
         self.endResetModel()
 
-    def set_filter(self, category: str = "", language: str = "", search: str = ""):
+    def set_filter(self, category: str = "", language: str = "", extension: str = "", search: str = ""):
         self.beginResetModel()
         self._cat_filter = category
         self._lang_filter = language
+        self._ext_filter = extension.lower() # NEW
         self._search = search.strip().lower()
         self._refilter()
         self.endResetModel()
@@ -173,8 +175,9 @@ class _AudioModel(QAbstractTableModel):
     def _refilter(self):
         cat = self._cat_filter
         lang = self._lang_filter
+        ext = self._ext_filter
         search = self._search
-        if not cat and not lang and not search:
+        if not cat and not lang and not ext and not search:
             self._filtered = list(range(len(self._all)))
             return
         result = []
@@ -183,6 +186,11 @@ class _AudioModel(QAbstractTableModel):
                 continue
             if lang and e.voice_lang != lang:
                 continue
+            if ext:
+                if ext == "none":
+                    if "." in e.entry.path: continue
+                elif not e.entry.path.lower().endswith(ext):
+                    continue
             if search:
                 # Search across filename, key, all translation texts, and NPC voice
                 all_texts = " ".join(e.text_translations.values()) if e.text_translations else e.text_original
@@ -219,7 +227,7 @@ class _AudioModel(QAbstractTableModel):
                 return os.path.basename(e.entry.path)
             elif col == _COL_LANG:
                 lang = e.voice_lang.lower() if e.voice_lang else ""
-                if lang == "ja":
+                if lang == "ch":
                     return "CH"
                 return lang.upper()
             elif col == _COL_CATEGORY:
@@ -235,16 +243,18 @@ class _AudioModel(QAbstractTableModel):
 
         elif role == Qt.ForegroundRole:
             if col == _COL_LANG:
-                colors = {"ko": QColor("#f9e2af"), "ja": QColor("#f38ba8"), "en": QColor("#89b4fa")}
+                colors = {"ko": QColor("#f9e2af"), "ch": QColor("#f38ba8"), "en": QColor("#89b4fa")}
                 return colors.get(e.voice_lang)
             if col == _COL_TEXT and e.text_original:
+                if not getattr(e, 'is_verified', False):
+                    return QColor("#9399b2") # Dimmer if not verified
                 return QColor("#a6e3a1")
 
-        elif role == Qt.ToolTipRole:
             lines = [
                 f"Game Path: {e.entry.path}",
                 f"Archive: {e.entry.paz_file}",
-                f"Key: {e.paloc_key}"
+                f"Key: {e.paloc_key}",
+                f"Verified: {'Yes' if getattr(e, 'is_verified', False) else 'No (Possible mismatch)'}"
             ]
             if e.text_original:
                 lines.append(f"Text: {e.text_original[:200]}")
@@ -311,7 +321,7 @@ class AudioTab(QWidget):
         self._lang_filter = QComboBox()
         self._lang_filter.addItem(ALL_LANGUAGES, "")
         self._lang_filter.addItem("Korean (KO)", "ko")
-        self._lang_filter.addItem("Chinois (CH)", "ja")
+        self._lang_filter.addItem("Chinese (CH)", "ch")
         self._lang_filter.addItem("English (EN)", "en")
         self._lang_filter.currentIndexChanged.connect(lambda _: self._apply_filter())
         self._lang_filter.setMinimumWidth(120)
@@ -323,6 +333,16 @@ class AudioTab(QWidget):
         self._cat_filter.currentIndexChanged.connect(lambda _: self._apply_filter())
         self._cat_filter.setMinimumWidth(140)
         tb.addWidget(self._cat_filter)
+
+        tb.addWidget(QLabel("Ext:"))
+        self._ext_filter_ui = QComboBox()
+        self._ext_filter_ui.addItem("All", "")
+        self._ext_filter_ui.addItem(".bnk", ".bnk")
+        self._ext_filter_ui.addItem(".wem", ".wem")
+        self._ext_filter_ui.addItem("None", "none")
+        self._ext_filter_ui.currentIndexChanged.connect(lambda _: self._apply_filter())
+        self._ext_filter_ui.setMinimumWidth(80)
+        tb.addWidget(self._ext_filter_ui)
 
         tb.addWidget(QLabel("Search:"))
         self._search_input = SearchHistoryLineEdit(self._config, "audio")
@@ -808,6 +828,7 @@ class AudioTab(QWidget):
             "Korean": "ko",
             "English": "en",
             "Japanese": "ja",
+            "Chinese": "ch",
             "Russian": "ru",
             "Turkish": "tr",
             "Spanish": "es",
@@ -856,15 +877,10 @@ class AudioTab(QWidget):
     def _suggest_omnivoice_voice(self, ae: AudioEntry) -> str:
         if not ae:
             return "auto"
-        if ae.voice_prefix.startswith("unique_"):
+        if ae.voice_prefix and ae.voice_prefix.startswith("unique_"):
             profile = self._suggest_omnivoice_profile_name(ae)
             return f"clone:{profile}" if profile else "auto"
-        if "female" in (ae.npc_gender or "").lower():
-            if ae.npc_age == "adult":
-                return "design:female,young adult,medium pitch"
-            return "design:female"
-        if "male" in (ae.npc_gender or "").lower() or ae.npc_age == "adult":
-            return "design:male,young adult,low pitch"
+        # Always return auto by default as requested.
         return "auto"
 
     def _persist_omnivoice_ui_state(self):
@@ -934,7 +950,6 @@ class AudioTab(QWidget):
                 "en-US", "en-GB", "ar-SA", "ko-KR", "ja-JP", "zh-CN",
                 "de-DE", "fr-FR", "es-ES", "it-IT", "pt-BR", "ru-RU",
             ])
-
         if current:
             self._tts_lang.setCurrentText(current)
         else:
@@ -947,16 +962,15 @@ class AudioTab(QWidget):
         else:
             self._tts_status_label.setText("Status: Ready")
 
-
-
     # ── Filtering ──
 
     def _apply_filter(self):
         cat = self._cat_filter.currentData() or ""
         lang = self._lang_filter.currentData() or ""
+        ext = self._ext_filter_ui.currentData() or ""
         search = self._search_input.text()
-        self._model.set_filter(cat, lang, search)
-        self._count_label.setText(f"{self._model.filtered_count:,} / {self._model.total_count:,}")
+        self._model.set_filter(cat, lang, ext, search)
+        self._count_label.setText(f"{self._model.filtered_count:,} / {self._model.total_count:,} files")
 
     # ── Playback + Text Display ──
 
@@ -985,10 +999,24 @@ class AudioTab(QWidget):
                 play_path = tmp
                 ext = os.path.splitext(basename)[1].lower()
                 if ext in (".wem", ".bnk"):
+                    from utils.vgmstream_installer import is_installed
+                    if not is_installed():
+                        self._progress.set_status("Downloading vgmstream decoder (first time only)...")
+                        QApplication.processEvents()
+
                     wav_out = os.path.join(self._temp_dir, f"{ae.package_group}_{os.path.splitext(basename)[0]}.wav")
                     wav = wem_to_wav(tmp, wav_out)
                     if wav:
                         play_path = wav
+                        # Clean up the raw WEM file to save space in the temp folder since we have the WAV
+                        try:
+                            os.remove(tmp)
+                        except OSError:
+                            pass
+                    else:
+                        self._progress.set_status("Decoding failed")
+                        show_error(self, "Playback Error", "Failed to decode WEM to WAV for preview. Please check your internet connection or vgmstream installation.")
+                        return
                 self._wav_cache[ck] = play_path
 
             self._audio_player.load_file(play_path)
@@ -997,7 +1025,7 @@ class AudioTab(QWidget):
             lines = []
             lines.append(f"File: {entry.path}")
             display_lang = ae.voice_lang.upper()
-            if ae.voice_lang.lower() == "ja":
+            if ae.voice_lang.lower() == "ch":
                 display_lang = "CH"
             lines.append(f"Language: {display_lang} | Category: {ae.category}")
             lines.append(f"NPC: {ae.npc_gender} {ae.npc_class} ({ae.npc_age})")
@@ -1006,7 +1034,7 @@ class AudioTab(QWidget):
 
             if ae.text_translations:
                 lang_names = {
-                    "ko": "Korean", "en": "English", "ja": "Chinois",
+                    "ko": "Korean", "en": "English", "ch": "Chinese",
                     "ru": "Russian", "tr": "Turkish", "es": "Spanish",
                     "es-mx": "Spanish (MX)", "fr": "French", "de": "German",
                     "it": "Italian", "pl": "Polish", "pt-br": "Portuguese (BR)",
@@ -1336,15 +1364,27 @@ class AudioTab(QWidget):
         ext = os.path.splitext(basename)[1].lower()
         out = tmp
         if ext in (".wem", ".bnk"):
+            from utils.vgmstream_installer import is_installed
+            if not is_installed():
+                self._progress.set_status("Downloading vgmstream decoder for reference audio...")
+                QApplication.processEvents()
+
             wav_out = os.path.join(self._temp_dir, f"ref_{ae.package_group}_{os.path.splitext(basename)[0]}.wav")
             out = wem_to_wav(tmp, wav_out) or ""
             if not out:
                 raise RuntimeError(f"Failed to decode reference audio: {entry.path}")
+            # Successful decode, clean up raw WEM to save space
+            try: os.remove(tmp)
+            except OSError: pass
+
         elif ext != ".wav":
             wav_out = os.path.join(self._temp_dir, f"ref_{ae.package_group}_{os.path.splitext(basename)[0]}.wav")
             out = audio_to_wav(tmp, wav_out) or ""
             if not out:
                 raise RuntimeError(f"Failed to convert reference audio: {entry.path}")
+            try: os.remove(tmp)
+            except OSError: pass
+
 
         self._wav_cache[cache_key] = out
         return out
@@ -1364,9 +1404,8 @@ class AudioTab(QWidget):
         if not self._omnivoice_profile_name.text().strip():
             self._omnivoice_profile_name.setText(self._suggest_omnivoice_profile_name(ae))
         if not (self._voice_combo.currentText() or "").strip():
-            self._voice_combo.setCurrentText(self._suggest_omnivoice_voice(ae))
-        elif (self._voice_combo.currentText() or "").strip() in {"auto", "design:"}:
-            self._voice_combo.setCurrentText(self._suggest_omnivoice_voice(ae))
+            self._voice_combo.setCurrentText("auto")
+        # Removed auto-suggestion overwrite to respect 'auto' by default as requested.
 
     def _save_omnivoice_profile(self):
         if not self._tts_engine or not self._is_omnivoice_provider():
@@ -1412,6 +1451,7 @@ class AudioTab(QWidget):
             return text if text else ""
             
         # No specific language requested (Auto), return original text
+        # But if the current voice is e.g. English, ae.text_original IS the English text.
         return ae.text_original or ""
 
     def _build_omnivoice_options(self, ae: AudioEntry = None, batch_mode: bool = False) -> dict:
@@ -1524,6 +1564,19 @@ class AudioTab(QWidget):
             show_error(self, "TTS Error", result.error or "Failed")
 
     def _generate_and_patch(self):
+        """Generate TTS audio and patch it directly into the game archive.
+
+        Workflow:
+            1. Validate selection and acquire audio entry metadata.
+            2. Synthesize TTS to WAV using the configured provider.
+            3. Convert WAV → WEM (Vorbis) via Wwise batch script.
+            4. Show confirmation dialog with size comparison.
+            5. Invoke RepackEngine to inject WEM into PAZ + update PAMT/PAPGT.
+            6. Invalidate VFS cache and reload PAMT from disk.
+            7. Auto-play the newly patched audio for immediate verification.
+            8. Show success feedback via status bar (non-blocking).
+        """
+        # ── Step 1: Validate selection ────────────────────────────────────────
         rows = sorted({i.row() for i in self._view.selectedIndexes()})
         if not rows:
             show_error(self, "Error", "Select an audio file first")
@@ -1532,19 +1585,38 @@ class AudioTab(QWidget):
         if not ae:
             return
 
+        entry = ae.entry
+        logger.info("[GENPATCH] ── Starting Generate + Patch ──────────────────")
+        logger.info("[GENPATCH] Target entry : %s", entry.path)
+        logger.info("[GENPATCH] PAZ file     : %s", entry.paz_file)
+        logger.info("[GENPATCH] Package group: %s", ae.package_group)
+        logger.info("[GENPATCH] Original size: %d bytes (orig) / %d bytes (comp)",
+                    entry.orig_size, entry.comp_size)
+
+        # ── Step 2: TTS Synthesis ─────────────────────────────────────────────
+        logger.info("[GENPATCH] Step 2: Synthesizing TTS audio...")
         self._generate_tts()
         if not self._generated_files:
+            logger.error("[GENPATCH] TTS synthesis produced no audio — aborting.")
             return
 
         tts_wav_path = self._generated_files[0]["path"]
+        tts_wav_size = os.path.getsize(tts_wav_path) if os.path.isfile(tts_wav_path) else 0
+        logger.info("[GENPATCH] TTS WAV ready: %s (%d bytes)", tts_wav_path, tts_wav_size)
+
         try:
             from core.repack_engine import RepackEngine, ModifiedFile
             from core.audio_converter import wav_to_wem
-            entry = ae.entry
-            orig_data = self._vfs.read_entry_data(entry)
 
+            # ── Step 2b: Read original WEM data for conversion reference ──────
+            logger.info("[GENPATCH] Reading original WEM data from PAZ for header reference...")
+            orig_data = self._vfs.read_entry_data(entry)
+            logger.info("[GENPATCH] Original WEM read: %d bytes", len(orig_data))
+
+            # ── Step 3: Check Wwise, then convert WAV → WEM ───────────────────
             from utils.wwise_installer import is_wwise_installed
             if not is_wwise_installed():
+                logger.error("[GENPATCH] Wwise is not installed — WAV→WEM conversion impossible.")
                 show_error(self, "Wwise Required",
                            "Audio patching requires Wwise (free) for Vorbis encoding.\n\n"
                            "The game only accepts Vorbis-encoded WEM audio.\n"
@@ -1556,52 +1628,135 @@ class AudioTab(QWidget):
                            "4. Restart CrimsonForge — it will auto-detect Wwise")
                 return
 
+            logger.info("[GENPATCH] Step 3: Converting WAV → WEM (Vorbis) via Wwise...")
             self._progress.set_status("Converting WAV to WEM (Vorbis)...")
             QApplication.processEvents()
 
-            wem_path = wav_to_wem(tts_wav_path, orig_data)
+            # ── Force WEM to be in same folder as WAV and use original filename ──
+            original_filename = os.path.basename(entry.path)
+            target_wem_path = os.path.join(os.path.dirname(tts_wav_path), original_filename)
+            logger.info("[GENPATCH]   Target WEM path: %s", target_wem_path)
+
+            wem_path = wav_to_wem(tts_wav_path, orig_data, output_path=target_wem_path)
             if not wem_path or not os.path.isfile(wem_path):
-                show_error(self, "Error",
+                logger.error("[GENPATCH] WAV→WEM conversion FAILED (wem_path=%s)", wem_path)
+                show_error(self, "Conversion Error",
                            "WAV to WEM conversion failed.\n"
-                           "Check Wwise installation and try again.")
+                           "Check Wwise installation and try again.\n\n"
+                           f"TTS WAV: {tts_wav_path}")
                 return
 
             with open(wem_path, "rb") as f:
                 new_data = f.read()
+            logger.info("[GENPATCH] WEM ready for patching: %s (%d bytes)", 
+                        target_wem_path, len(new_data))
 
+            # ── Step 4: Confirm patch with user ───────────────────────────────
             orig_text = ae.text_original or "[No text linked]"
             new_text = self._tts_text.toPlainText().strip()
-            
+
+            logger.info("[GENPATCH] Step 4: Waiting for user confirmation...")
             if not confirm_action(self, "Patch Audio",
                                   f"Replace {entry.path}?\n\n"
                                   f"Original Dialogue:\n{orig_text[:200]}\n\n"
                                   f"New TTS Text:\n{new_text[:200]}\n\n"
                                   f"Original: {format_file_size(len(orig_data))} (WEM Vorbis)\n"
-                                  f"New: {format_file_size(len(new_data))} (WEM Vorbis)\n\n"
+                                  f"New:      {format_file_size(len(new_data))} (WEM Vorbis)\n\n"
                                   f"The generated audio will be written directly into the game archive."):
+                logger.info("[GENPATCH] User cancelled patch.")
                 return
 
+            # ── Step 5: Invoke RepackEngine ───────────────────────────────────
             game = os.path.dirname(os.path.dirname(entry.paz_file))
             papgt = os.path.join(game, "meta", "0.papgt")
             grp = os.path.basename(os.path.dirname(entry.paz_file))
+
+            logger.info("[GENPATCH] Step 5: Invoking RepackEngine...")
+            logger.info("[GENPATCH]   game dir : %s", game)
+            logger.info("[GENPATCH]   papgt    : %s", papgt)
+            logger.info("[GENPATCH]   group    : %s", grp)
+
             pamt = self._vfs.load_pamt(grp)
             mf = ModifiedFile(data=new_data, entry=entry, pamt_data=pamt, package_group=grp)
 
-            self._progress.set_status("Patching to game...")
+            self._progress.set_status("Patching to game archive...")
             QApplication.processEvents()
 
             result = RepackEngine(game).repack([mf], papgt_path=papgt)
-            if result.success:
-                self._progress.set_status(f"Patched: {entry.path}")
-                show_info(self, "Patched",
-                          f"TTS audio patched to {entry.path}\n\n"
-                          f"Original: {format_file_size(len(orig_data))}\n"
-                          f"New: {format_file_size(len(new_data))}\n\n"
-                          f"Launch the game to hear your changes!")
-            else:
-                show_error(self, "Error", "\n".join(result.errors) if getattr(result, "errors", None) else "Patch failed")
+
+            if not result.success:
+                err_msg = "\n".join(result.errors) if getattr(result, "errors", None) else "Unknown repack error"
+                logger.error("[GENPATCH] RepackEngine FAILED: %s", err_msg)
+                show_error(self, "Patch Failed", err_msg)
+                return
+
+            logger.info("[GENPATCH] RepackEngine SUCCESS — paz_crc=0x%08X pamt_crc=0x%08X papgt_crc=0x%08X",
+                        result.paz_crc, result.pamt_crc, result.papgt_crc)
+            logger.info("[GENPATCH]   New WEM size in archive: %d bytes", len(new_data))
+            logger.info("[GENPATCH]   Backup dir: %s", result.backup_dir)
+
+            # ── Step 6: Invalidate caches and reload VFS ──────────────────────
+            logger.info("[GENPATCH] Step 6: Invalidating caches and reloading VFS...")
+            
+            # 6a. Clear the internal WAV preview cache
+            ck = f"{ae.package_group}:{entry.path}"
+            if ck in self._wav_cache:
+                stale_path = self._wav_cache.pop(ck)
+                try:
+                    if stale_path and os.path.isfile(stale_path):
+                        os.remove(stale_path)
+                        logger.info("[GENPATCH] Deleted stale WAV cache: %s", stale_path)
+                except OSError as e:
+                    logger.warning("[GENPATCH] Could not delete stale WAV: %s — %s", stale_path, e)
+
+            # 6b. Delete stale temp WEM/WAV in the session folder
+            basename = os.path.basename(entry.path)
+            stale_wem = os.path.join(self._temp_dir, f"{ae.package_group}_{basename}")
+            stale_wav = os.path.join(self._temp_dir, f"{ae.package_group}_{os.path.splitext(basename)[0]}.wav")
+            for stale in (stale_wem, stale_wav):
+                try:
+                    if os.path.isfile(stale):
+                        os.remove(stale)
+                        logger.info("[GENPATCH] Deleted stale temp file: %s", stale)
+                except OSError as e:
+                    logger.warning("[GENPATCH] Could not delete stale temp file %s — %s", stale, e)
+
+            # 6c. Force VFS cache invalidation so it re-reads PAMT from disk
+            self._vfs.invalidate_pamt_cache(ae.package_group)
+            
+            # 6d. Reload PAMT to sync the AudioEntry model with the new archive state
+            updated_pamt = self._vfs.load_pamt(ae.package_group)
+            from core.pamt_parser import find_file_entry
+            updated_entry = find_file_entry(updated_pamt, entry.path)
+            
+            if updated_entry:
+                logger.info("[GENPATCH] Updated entry found — new offset=0x%08X comp=%d orig=%d",
+                            updated_entry.offset, updated_entry.comp_size, updated_entry.orig_size)
+                ae.entry = updated_entry
+                ae.size = updated_entry.comp_size
+                # Refresh the table row
+                self._model.dataChanged.emit(
+                    self._model.index(rows[0], 0),
+                    self._model.index(rows[0], self._model.columnCount() - 1)
+                )
+            
+            # ── Step 7: Auto-play and confirmation dialog ─────────────────────
+            logger.info("[GENPATCH] Step 7: Final verification & notification...")
+            self._play_and_show(ae)
+            
+            msg = (f"Successfully patched {original_filename}\n\n"
+                   f"The game archive was updated and re-verified.\n"
+                   f"New archive size: {format_file_size(ae.size)}\n\n"
+                   f"The patched audio is playing now for verification.")
+            
+            show_info(self, "Patch Successful", msg)
+            self._progress.set_status(f"✓ Patched: {original_filename}")
+            logger.info("[GENPATCH] ── Generate + Patch COMPLETE ──────────────────────")
+
         except Exception as e:
+            logger.exception("[GENPATCH] Unhandled exception during Generate + Patch: %s", e)
             show_error(self, "Error", str(e))
+
 
     def _resolve_batch_entries(self) -> list[AudioEntry]:
         selected_rows = sorted({i.row() for i in self._view.selectedIndexes()})

@@ -230,3 +230,22 @@ def update_pamt_self_crc(pamt_raw: bytearray) -> int:
     new_crc = pa_checksum(bytes(pamt_raw[12:]))
     struct.pack_into("<I", pamt_raw, 0, new_crc)
     return new_crc
+
+
+def find_file_entry(pamt_data: "PamtData", file_path: str) -> Optional["PamtFileEntry"]:
+    """Find a file entry in a PamtData object by its virtual path.
+
+    Comparison is case-insensitive and normalises backslash/forward-slash.
+
+    Args:
+        pamt_data: Parsed PAMT data (freshly loaded from disk after a repack).
+        file_path: The virtual path of the file (e.g. ``sound/pc/en/voice.wem``).
+
+    Returns:
+        The matching PamtFileEntry, or None if not found.
+    """
+    needle = file_path.replace("\\", "/").lower()
+    for entry in pamt_data.file_entries:
+        if entry.path.replace("\\", "/").lower() == needle:
+            return entry
+    return None

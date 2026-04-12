@@ -10,6 +10,7 @@ venv/
 # Build outputs
 build/
 dist/
+env
 
 # Generated exports
 exports/

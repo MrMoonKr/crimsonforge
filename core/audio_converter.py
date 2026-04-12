@@ -34,9 +34,18 @@ def _find_tool(name: str) -> str:
 
 
 def get_vgmstream_path() -> str:
-    """Get path to vgmstream-cli executable."""
-    from utils.vgmstream_installer import get_vgmstream_path as _get
-    return _get()
+    """Get path to vgmstream-cli executable. Auto-installs if not found."""
+    from utils.vgmstream_installer import get_vgmstream_path as _get, install_vgmstream
+    path = _get()
+    if path:
+        return path
+    # Auto-install
+    logger.info("vgmstream not found, auto-installing...")
+    success, msg = install_vgmstream(lambda m: logger.info("vgmstream: %s", m))
+    if success:
+        return _get()
+    logger.warning("vgmstream auto-install failed: %s", msg)
+    return ""
 
 
 def get_ffmpeg_path() -> str:
@@ -182,9 +191,15 @@ def wav_to_wem(wav_path: str, original_wem_data: bytes,
     """
     import struct
 
+    logger.info("[CONVERTER] wav_to_wem called")
+    logger.info("[CONVERTER]   wav_path   : %s", wav_path)
+    logger.info("[CONVERTER]   wav exists : %s", os.path.isfile(wav_path))
+    logger.info("[CONVERTER]   orig_wem   : %d bytes", len(original_wem_data))
+
     if not output_path:
         basename = os.path.splitext(os.path.basename(wav_path))[0]
         output_path = os.path.join(tempfile.gettempdir(), f"cf_wem_{basename}.wem")
+    logger.info("[CONVERTER]   output_path: %s", output_path)
 
     # Read original WEM to get sample rate and channels
     orig_sample_rate = 48000
@@ -192,9 +207,13 @@ def wav_to_wem(wav_path: str, original_wem_data: bytes,
     if len(original_wem_data) >= 28 and original_wem_data[:4] == b"RIFF":
         orig_channels = struct.unpack_from("<H", original_wem_data, 22)[0]
         orig_sample_rate = struct.unpack_from("<I", original_wem_data, 24)[0]
+        logger.info("[CONVERTER]   orig WEM header: %d Hz, %d ch", orig_sample_rate, orig_channels)
+    else:
+        logger.warning("[CONVERTER]   original WEM is not RIFF/WEM — using defaults 48000 Hz mono")
 
     # Step 1: Normalize WAV to match original (sample rate, channels)
     ffmpeg = get_ffmpeg_path()
+    logger.info("[CONVERTER]   ffmpeg path: %s", ffmpeg or '(NOT FOUND)')
     normalized_wav = wav_path + ".norm.wav"
 
     if ffmpeg:
@@ -208,9 +227,15 @@ def wav_to_wem(wav_path: str, original_wem_data: bytes,
                 capture_output=True, text=True, timeout=60,
             )
             if result.returncode == 0 and os.path.isfile(normalized_wav):
+                logger.info("[CONVERTER]   ffmpeg normalize OK -> %s", normalized_wav)
                 wav_path = normalized_wav
-        except Exception:
-            pass
+            else:
+                logger.warning("[CONVERTER]   ffmpeg normalize FAILED (rc=%d): %s",
+                               result.returncode, result.stderr[:500])
+        except Exception as exc:
+            logger.warning("[CONVERTER]   ffmpeg normalize exception: %s", exc)
+    else:
+        logger.warning("[CONVERTER]   ffmpeg not available — skipping WAV normalization")
 
     # Step 2: Try to create OGG Vorbis (matches the game's WEM Vorbis format)
     ogg_path = wav_path + ".ogg"
@@ -229,14 +254,19 @@ def wav_to_wem(wav_path: str, original_wem_data: bytes,
             )
             if result.returncode == 0 and os.path.isfile(ogg_path):
                 has_ogg = True
-        except Exception:
-            pass
+                logger.info("[CONVERTER]   ffmpeg OGG created: %s", ogg_path)
+            else:
+                logger.warning("[CONVERTER]   ffmpeg OGG FAILED (rc=%d): %s",
+                               result.returncode, result.stderr[:300])
+        except Exception as exc:
+            logger.warning("[CONVERTER]   ffmpeg OGG exception: %s", exc)
 
     # Try Wwise for proper Vorbis encoding (game requires Vorbis WEM)
+    logger.info("[CONVERTER]   Calling Wwise for Vorbis WEM encoding...")
     from utils.wwise_installer import find_wwise_console, convert_wav_to_wem_vorbis
     wwise = find_wwise_console()
+    logger.info("[CONVERTER]   WwiseConsole path: %s", wwise or '(NOT FOUND)')
     if wwise:
-        logger.info("Using Wwise for Vorbis WEM encoding: %s", wwise)
         result = convert_wav_to_wem_vorbis(
             wav_path, output_path,
             sample_rate=orig_sample_rate,
@@ -244,6 +274,8 @@ def wav_to_wem(wav_path: str, original_wem_data: bytes,
             wwise_console=wwise,
         )
         if result:
+            logger.info("[CONVERTER]   Wwise conversion OK: %s (%d bytes)",
+                        result, os.path.getsize(result))
             # Cleanup temp files
             for tmp_file in [normalized_wav, ogg_path]:
                 if os.path.isfile(tmp_file) and tmp_file != wav_path:
@@ -252,6 +284,9 @@ def wav_to_wem(wav_path: str, original_wem_data: bytes,
                     except Exception:
                         pass
             return result
+        else:
+            logger.error("[CONVERTER]   Wwise conversion returned empty path")
+
 
     # Fallback: build PCM WEM (may not play in all games)
     logger.warning("Wwise not found — building PCM WEM (may be silent in-game). "

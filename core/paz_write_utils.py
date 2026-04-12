@@ -4,6 +4,9 @@ import os
 
 from core.pamt_parser import PamtFileEntry
 from utils.platform_utils import get_file_timestamps, pad_to_16, set_file_timestamps
+from utils.logger import get_logger
+
+logger = get_logger("core.paz_write_utils")
 
 
 def build_space_map(entries: list[PamtFileEntry]) -> dict[tuple[str, int], int]:
@@ -46,6 +49,7 @@ def write_entry_payload(
         ts = get_file_timestamps(paz_path)
 
     if len(padded) <= max_space:
+        logger.info("[PAZ_WRITE] Overwriting entry in %s at offset 0x%08X (size %d)", paz_path, entry.offset, len(padded))
         with open(paz_path, "r+b") as f:
             f.seek(entry.offset)
             f.write(padded)
@@ -53,6 +57,7 @@ def write_entry_payload(
     else:
         paz_size = os.path.getsize(paz_path)
         aligned = (paz_size + 15) & ~15
+        logger.info("[PAZ_WRITE] Appending entry to %s at new offset 0x%08X (size %d)", paz_path, aligned, len(padded))
         with open(paz_path, "r+b") as f:
             if zero_old_region_on_relocate:
                 f.seek(entry.offset)

@@ -111,6 +111,16 @@ class VfsManager:
         """Get cached PAMT data for a group. Returns None if not loaded."""
         return self._pamt_cache.get(group_dir)
 
+    def invalidate_pamt_cache(self, group_dir: str):
+        """Clear a group from the PAMT cache to force a reload from disk.
+        
+        Call this after repacking a group to ensure subsequent reads see 
+        the updated offsets and metadata.
+        """
+        if group_dir in self._pamt_cache:
+            del self._pamt_cache[group_dir]
+            logger.info("Invalidated PAMT cache for group: %s", group_dir)
+
     def extract_entry(
         self,
         entry: PamtFileEntry,

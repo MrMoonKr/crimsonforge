@@ -2,6 +2,9 @@
 
 import sys
 import os
+import tempfile
+import glob
+import shutil
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -21,6 +24,35 @@ def _close_splash():
         pyi_splash.close()
     except ImportError:
         pass
+
+
+def _cleanup_temp_files():
+    """Delete all temporary directories and files created during the session."""
+    tmp = tempfile.gettempdir()
+    patterns = [
+        "crimsonforge_audio_*",
+        "crimsonforge_preview_*",
+        "cf_wem_out",
+        "cf_wwise_project",
+        "cf_wwise_*",
+        "cf_wem_*.wem"
+    ]
+    
+    count = 0
+    for pat in patterns:
+        for path in glob.glob(os.path.join(tmp, pat)):
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+                count += 1
+            except Exception:
+                pass
+                
+    if count > 0:
+        log = get_logger("cleanup")
+        log.info("Cleaned up %d temporary files/folders on exit", count)
 
 
 def main():
@@ -67,7 +99,12 @@ def main():
     window.show()
 
     logger.info("Application ready")
-    return app.exec()
+    ret = app.exec()
+    
+    logger.info("Application closing. Running cleanup...")
+    _cleanup_temp_files()
+    
+    return ret
 
 
 if __name__ == "__main__":

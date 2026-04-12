@@ -125,6 +125,7 @@ class RepackEngine:
             backup_dir_used = backup_record.backup_dir
 
         papgt_data = parse_papgt(papgt_path)
+        logger.info("[REPACK] Working with PAPGT index: %s", papgt_path)
         papgt_raw = bytearray(papgt_data.raw_data)
 
         last_papgt_crc = 0
@@ -156,6 +157,9 @@ class RepackEngine:
                 new_orig_size = len(mf.data)
 
                 paz_path = mf.entry.paz_file
+                logger.info("[REPACK] Writing payload for %s: %d bytes (Original source: %d bytes)", 
+                            mf.entry.path, new_comp_size, new_orig_size)
+                
                 new_offset, _ = write_entry_payload(
                     mf.entry,
                     processed_data,
@@ -217,6 +221,8 @@ class RepackEngine:
             last_pamt_crc = new_pamt_crc
 
             pamt_path = pamt_data.path
+            logger.info("[REPACK] Writing updated PAMT: %s (New CRC: 0x%08X)", pamt_path, new_pamt_crc)
+            
             if preserve_timestamps:
                 ts = get_file_timestamps(pamt_path)
             atomic_write(pamt_path, bytes(pamt_raw))
