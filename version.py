@@ -17,11 +17,18 @@ VERSION BUMPING RULES
 __all__ = ["APP_VERSION", "APP_NAME", "CHANGELOG"]
 
 APP_NAME = "CrimsonForge"
-APP_VERSION = "1.22.4"
+APP_VERSION = "1.22.5"
 
 # Each entry: (version, date, list_of_changes)
 # Newest first. `date` is YYYY-MM-DD.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
+    (
+        "1.22.5", "2026-04-22", [
+            "[Fix] pa_checksum no longer triggers false-positive virus flags from Windows Defender / some third-party AVs. The previous MinGW-compiled ctypes DLL (core/pa_checksum.dll) matched heuristic patterns AVs associate with malware loaders. Switched to a MSVC-compiled Python C extension (core/_pa_checksum.cp*-win_amd64.pyd) loaded via Python's own import machinery, which inherits Python's AV trust path. No observable performance difference — same Bob Jenkins Lookup3 C core, cross-verified bit-for-bit against the old DLL's output.",
+            "[Enhancement] Removed the ctypes fallback branch from core/checksum_engine.py — the dispatcher is now C extension when compiled, pure Python otherwise. Cleaner two-path logic instead of three.",
+            "[Enhancement] CrimsonForge.spec simplified — no explicit binaries entry, the .pyd is auto-discovered through a hiddenimport. PyInstaller bundles it into the frozen exe via the Python extension machinery rather than as a loose DLL.",
+        ],
+    ),
     (
         "1.22.4", "2026-04-22", [
             "[Fix] FBX export of character meshes (cd_phm_*, cd_phw_*, cd_ppdm_*, cd_pgm_*, cd_pfm_*, etc.) now correctly finds the shared class-level skeleton. Previously the mesh export path used a sibling/basename search that was guaranteed to miss for character PACs (they share phm_01.pab / phw_01.pab / ppdm_01.pab class rigs, not per-mesh PABs). Root cause of the reported 'no armature in exported FBX' bug.",

@@ -39,11 +39,25 @@ DATA_FILES += collect_optional_tree(os.path.join(USER_HOME, '.crimsonforge', 'to
 a = Analysis(
     [os.path.join(ROOT, 'main.py')],
     pathex=[ROOT],
-    binaries=[
-        (os.path.join(ROOT, 'core', 'pa_checksum.dll'), 'core'),
-    ],
+    # The PaChecksum native code now ships as a Python C extension
+    # (core/_pa_checksum.cp*-win_amd64.pyd) compiled via MSVC. It is
+    # auto-discovered by PyInstaller through the hiddenimport below,
+    # so no explicit binaries entry is needed.
+    #
+    # The previous setup shipped a raw ctypes DLL (pa_checksum.dll)
+    # compiled with MinGW gcc. That triggered false-positive virus
+    # flags on several users' machines because:
+    #   1. The DLL was unsigned.
+    #   2. MinGW-compiled binaries share byte-level patterns with
+    #      malware loaders, which AV heuristics lock onto.
+    #   3. ctypes-loaded standalone DLLs are treated by AV as
+    #      unknown low-reputation code, while .pyd files load via
+    #      Python's own import machinery and get AV trust paths.
+    # Switching to a .pyd built with MSVC fixed the false positives.
+    binaries=[],
     datas=DATA_FILES,
     hiddenimports=[
+        'core._pa_checksum',
         # AI providers
         'ai.provider_openai_compat',
         'ai.provider_anthropic',

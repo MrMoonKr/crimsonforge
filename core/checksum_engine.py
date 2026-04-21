@@ -1,10 +1,28 @@
 """PaChecksum algorithm - Pearl Abyss custom Bob Jenkins Lookup3 variant.
 
-Uses a compiled C extension for speed (~100x faster than pure Python).
-Falls back to pure Python if the C extension is not built.
+Loads the MSVC-compiled Python C extension ``core._pa_checksum``
+(file: ``core/_pa_checksum.cp*-*.pyd``) for ~100x speedup over the
+pure-Python fallback below.
 
-To build the C extension:
-    python3 setup_checksum.py build_ext --inplace
+Why Python C extension and not a ctypes DLL:
+Prior to v1.22.5 we shipped a MinGW-compiled ``pa_checksum.dll``
+loaded via ``ctypes.CDLL(...)``. Windows Defender flagged it as
+suspicious on multiple users' machines because:
+
+  1. The DLL was unsigned.
+  2. MinGW-compiled binaries share byte-level patterns with malware
+     loaders that AV heuristics lock onto.
+  3. Standalone ctypes DLLs are treated as unknown low-reputation
+     code. ``.pyd`` files, by contrast, load via Python's import
+     machinery and inherit Python's AV trust path.
+
+Switching to a .pyd built with MSVC eliminates the false positives
+while keeping the speedup. The pure-Python fallback remains as a
+second line of defence for source-only installs where the extension
+hasn't been compiled.
+
+Build the extension:
+    python setup_checksum.py build_ext --inplace
 
 The checksum chain is:
   PAZ CRC -> stored in PAMT PAZ table
@@ -14,14 +32,10 @@ The checksum chain is:
 
 import struct
 
-import ctypes
-import os as _os
-import sys as _sys
-
 _USE_C = False
-_USE_DLL = False
 
-# Priority 1: Python C extension (fastest, requires build)
+# Try loading the compiled Python C extension. Missing is fine —
+# we fall back to pure Python below.
 try:
     from core._pa_checksum import pa_checksum as _c_pa_checksum
     from core._pa_checksum import checksum_file as _c_checksum_file
@@ -29,27 +43,9 @@ try:
 except ImportError:
     pass
 
-# Priority 2: Standalone DLL via ctypes (no Python.h needed)
-if not _USE_C:
-    # Check multiple locations: next to this .py, frozen exe temp dir, exe dir
-    _dll_candidates = [
-        _os.path.join(_os.path.dirname(__file__), "pa_checksum.dll"),
-        _os.path.join(getattr(_sys, '_MEIPASS', ''), "core", "pa_checksum.dll"),
-        _os.path.join(_os.path.dirname(_sys.executable), "core", "pa_checksum.dll"),
-    ]
-    _dll_path = ""
-    for _p in _dll_candidates:
-        if _os.path.isfile(_p):
-            _dll_path = _p
-            break
-    if _os.path.isfile(_dll_path):
-        try:
-            _dll = ctypes.CDLL(_dll_path)
-            _dll.pa_checksum.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
-            _dll.pa_checksum.restype = ctypes.c_uint32
-            _USE_DLL = True
-        except Exception:
-            pass
+# Kept for back-compat: code that previously gated on _USE_DLL
+# still imports successfully but it will always be False now.
+_USE_DLL = False
 
 PA_MAGIC = 0x2145E233
 MASK = 0xFFFFFFFF
@@ -128,11 +124,11 @@ def _pa_checksum_python(data: bytes) -> int:
 
 
 def pa_checksum(data: bytes) -> int:
-    """Compute PaChecksum. Uses C extension > DLL > pure Python."""
+    """Compute PaChecksum. Uses the compiled C extension when
+    available, otherwise the pure-Python fallback.
+    """
     if _USE_C:
         return _c_pa_checksum(data)
-    if _USE_DLL:
-        return _dll.pa_checksum(data, len(data))
     return _pa_checksum_python(data)
 
 
