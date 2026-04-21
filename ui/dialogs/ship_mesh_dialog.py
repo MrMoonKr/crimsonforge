@@ -379,6 +379,46 @@ class ShipMeshDialog(QDialog):
             QMessageBox.warning(self, "Missing OBJ", str(exc))
             return
 
+        # Pre-flight memory check. We estimate peak RAM based on the
+        # combined size of the OBJ(s) the user picked; the actual
+        # repack holds the original PACs, the parsed meshes, and the
+        # rebuilt PAZ archives in memory simultaneously. On machines
+        # that are already saturated (Blender + JMM open at the same
+        # time), a single extra gigabyte can push Windows into page-
+        # file thrashing — the 1-FPS freeze one reporter saw.
+        total_obj_size = 0
+        for req in requests:
+            try:
+                total_obj_size += os.path.getsize(req.obj_path)
+            except OSError:
+                pass
+        if total_obj_size > 0:
+            from core.mesh_preflight import (
+                MemoryStatus,
+                check_memory_for_repack,
+            )
+            mem = check_memory_for_repack(total_obj_size)
+            if mem.status == MemoryStatus.INSUFFICIENT:
+                reply = QMessageBox.warning(
+                    self,
+                    "Low memory warning",
+                    mem.recommendation + "\n\nProceed anyway?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+            elif mem.status == MemoryStatus.TIGHT:
+                reply = QMessageBox.warning(
+                    self,
+                    "Tight memory",
+                    mem.recommendation + "\n\nProceed?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+
         default_name = mod_name.replace(" ", "_").replace("-", "_")
         if package_mode == "manager":
             default_name += "_manager"

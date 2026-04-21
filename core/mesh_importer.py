@@ -2570,7 +2570,19 @@ def _build_pac_full_rebuild(
 
 
 def build_pac(mesh: ParsedMesh, original_data: bytes) -> bytes:
-    """Rebuild a PAC binary from a modified mesh."""
+    """Rebuild a PAC binary from a modified mesh.
+
+    Performance note (v1.22.4): previously opened with a full
+    ``copy.deepcopy(mesh)`` which walks every vertex/face/uv/normal
+    tuple in the graph. On a 20 k-vertex character that's a multi-
+    hundred-megabyte allocation. We replaced it with a shallow
+    wrapper copy + a new submesh LIST (but the submesh OBJECTS are
+    shared with the caller). The rebuild path reads submesh fields
+    read-only; any mutation would go through :func:`_merge_partial_pac_import`
+    which deep-copies each submesh it needs to reshape. This cuts
+    the setup cost from O(n_vertices) down to O(n_submeshes)
+    (typically 5-20) with zero correctness change.
+    """
     if not original_data or original_data[:4] != b"PAR ":
         raise ValueError("Original PAC data required for rebuild")
 
@@ -2578,7 +2590,8 @@ def build_pac(mesh: ParsedMesh, original_data: bytes) -> bytes:
     if not original_mesh.submeshes:
         raise ValueError("Original PAC could not be parsed into usable geometry")
 
-    working_mesh = copy.deepcopy(mesh)
+    working_mesh = copy.copy(mesh)
+    working_mesh.submeshes = list(mesh.submeshes)
     working_mesh = _merge_partial_pac_import(original_mesh, working_mesh)
     _align_submesh_order_like_original(original_mesh, working_mesh)
 

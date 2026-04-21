@@ -8,6 +8,23 @@ import shutil
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# ── Crash diagnostics: install FIRST, before any import that could
+#    fail at module-init time. Previously a native DLL-load crash in
+#    QApplication() or in a hidden import exited the process with
+#    zero log output. faulthandler now captures C-level faults and
+#    the Python excepthook catches uncaught exceptions. Both write
+#    to the session log before the process dies. See
+#    core.crash_handler for the three-layer defence.
+try:
+    from core.crash_handler import install_crash_handlers, log_and_show_fatal
+    _crash_log_path = os.path.join(tempfile.gettempdir(), "crimsonforge.log")
+    install_crash_handlers(_crash_log_path)
+except Exception:
+    # Best-effort only — the rest of the app must still boot even
+    # when the diagnostics module can't load.
+    def log_and_show_fatal(title, message):   # type: ignore[no-redef]
+        pass
+
 from PySide6.QtWidgets import QApplication
 
 from version import APP_VERSION, APP_NAME
@@ -56,7 +73,30 @@ def _cleanup_temp_files():
 
 
 def main():
-    app = QApplication(sys.argv)
+    # QApplication() is the single most-likely silent-crash point in
+    # PyInstaller bundles — it loads the Qt platform plugin which can
+    # abort natively when the plugin DLL is truncated (e.g. after a
+    # force-reboot interrupted the bundle extraction). We surround it
+    # with a Python try/except so any Python-level failure surfaces
+    # as a log line + native MessageBox; faulthandler (installed at
+    # module top) catches the native-abort case.
+    try:
+        app = QApplication(sys.argv)
+    except Exception as e:
+        log_and_show_fatal(
+            "CrimsonForge — Qt initialisation failed",
+            (
+                f"Qt / PySide6 could not be initialised:\n\n{type(e).__name__}: {e}\n\n"
+                "Likely causes:\n"
+                "  • Hard reboot corrupted the PyInstaller extraction. "
+                "Delete %TEMP%\\_MEI* folders and retry.\n"
+                "  • Missing VC++ 2015-2022 redistributable "
+                "(https://aka.ms/vs/17/release/vc_redist.x64.exe).\n"
+                "  • Antivirus quarantined a bundled DLL. "
+                "Whitelist the exe and %TEMP%\\_MEI* folders."
+            ),
+        )
+        return 1
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName("hzeem")

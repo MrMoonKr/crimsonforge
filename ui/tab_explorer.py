@@ -1360,70 +1360,45 @@ class ExplorerTab(QWidget):
             clean_path = entry.path.replace("\\", "/")
             basename = os.path.splitext(clean_path)[0].replace("/", "_")
 
-            # Try to find matching skeleton (.pab) for PAC files.
-            # Strategy: prefer the exact sibling path (cd_foo.pab next to
-            # cd_foo.pac), then fall back to basename match across every
-            # loaded PAMT. Skinned PACs (cd_phm_*, cd_phw_*, etc.) ship
-            # their skeleton in the SAME group, so the sibling hit is the
-            # common case; the basename fallback catches assets where the
-            # .pab lives in a different subdirectory of the group.
+            # Resolve the rig via the shared skeleton resolver. Pearl
+            # Abyss character meshes share a class-level skeleton
+            # (cd_phm_* → phm_01.pab, cd_phw_* → phw_01.pab, ...).
+            # The resolver handles every prefix family; manual override
+            # via config lets the user override the auto-pick.
             skeleton = None
             bone_count = 0
+            pab_path_used = ""
             pab_search_attempted = False
             pab_search_reason = ""
+            resolution_source = ""
+            rig_prefix = None
             if entry.path.lower().endswith(".pac") and fmt == "fbx":
                 pab_search_attempted = True
-                pab_sibling_path = entry.path[:-4] + ".pab"   # .pac -> .pab
-                pab_basename = os.path.basename(pab_sibling_path).lower()
-                from core.pamt_parser import find_file_entry
-                from core.skeleton_parser import parse_pab
-
-                def _try_load_pab(pab_entry, source_path):
-                    nonlocal skeleton, bone_count, pab_search_reason
-                    try:
-                        pab_data = self._vfs.read_entry_data(pab_entry)
-                    except Exception as e:
-                        pab_search_reason = f"read failed for {source_path}: {e}"
-                        return False
-                    if not pab_data or pab_data[:4] != b"PAR ":
-                        pab_search_reason = f"{source_path} is not a PAR file"
-                        return False
-                    try:
-                        parsed = parse_pab(pab_data, source_path)
-                    except Exception as e:
-                        pab_search_reason = f"parse failed for {source_path}: {e}"
-                        return False
-                    if not parsed.bones:
-                        pab_search_reason = f"{source_path} has zero bones"
-                        return False
-                    skeleton = parsed
-                    bone_count = len(parsed.bones)
-                    return True
-
-                # Pass 1 — exact sibling path in every loaded PAMT.
-                for _g, pamt_data in self._vfs._pamt_cache.items():
-                    pab_entry = find_file_entry(pamt_data, pab_sibling_path)
-                    if pab_entry and _try_load_pab(pab_entry, pab_sibling_path):
-                        break
-
-                # Pass 2 — basename match anywhere (different subdir).
-                if skeleton is None:
-                    for _g, pamt_data in self._vfs._pamt_cache.items():
-                        for file_entry in pamt_data.file_entries:
-                            if os.path.basename(file_entry.path).lower() == pab_basename:
-                                if _try_load_pab(file_entry, file_entry.path):
-                                    break
-                        if skeleton is not None:
-                            break
-
-                # Pass 3 — no exact-name hit; fallback is silent-mesh-only.
-                # We set a reason string so the user sees WHY the armature
-                # is missing instead of a silent mesh-only export.
-                if skeleton is None and not pab_search_reason:
-                    pab_search_reason = (
-                        f"No {pab_basename!r} found in any loaded PAMT. "
-                        "Make sure the skeleton archive is loaded before export."
+                from core.skeleton_resolver import (
+                    VfsManagerAdapter,
+                    detect_rig_prefix,
+                    resolve_skeleton,
+                )
+                rig_prefix = detect_rig_prefix(entry.path)
+                # Honour any per-rig-class override the user saved from
+                # a previous "Browse for .pab..." click.
+                manual_override = ""
+                if rig_prefix:
+                    manual_override = self._config.get(
+                        f"explorer.skeleton_override.{rig_prefix}", "",
                     )
+                adapter = VfsManagerAdapter(self._vfs)
+                resolution = resolve_skeleton(
+                    entry.path, adapter,
+                    manual_override=manual_override or None,
+                )
+                if resolution.skeleton is not None:
+                    skeleton = resolution.skeleton
+                    bone_count = len(skeleton.bones)
+                    pab_path_used = resolution.pab_path
+                    resolution_source = resolution.source
+                else:
+                    pab_search_reason = resolution.reason
 
             if fmt == "obj":
                 from core.mesh_exporter import export_obj
@@ -1434,28 +1409,82 @@ class ExplorerTab(QWidget):
             elif skeleton and skeleton.bones:
                 from core.mesh_exporter import export_fbx_with_skeleton
                 export_fbx_with_skeleton(mesh, skeleton, output_dir, basename)
+                pab_label = os.path.basename(pab_path_used) if pab_path_used else "?"
                 self._progress.set_status(
-                    f"Exported FBX: {mesh.total_vertices:,} verts, {mesh.total_faces:,} faces, {bone_count} bones"
+                    f"Exported FBX: {mesh.total_vertices:,} verts, "
+                    f"{mesh.total_faces:,} faces, {bone_count} bones "
+                    f"[rig={pab_label}, source={resolution_source}]"
                 )
             else:
-                # Mesh-only FBX. For PAC inputs, surface a confirmation so
-                # the user isn't surprised by an armature-less export.
+                # Mesh-only path. For PAC inputs, surface a three-choice
+                # dialog: Browse for .pab / Continue mesh-only / Cancel.
+                # The browse button lets the user pick any .pab in the
+                # VFS and remembers that choice per rig prefix so they
+                # only pick once per character class.
                 if pab_search_attempted:
-                    from ui.dialogs.confirmation import confirm_action
-                    proceed = confirm_action(
-                        self,
-                        "Skeleton not found",
-                        (
-                            f"No matching .pab skeleton could be loaded for "
-                            f"{os.path.basename(entry.path)}.\n\n"
-                            f"Reason: {pab_search_reason}\n\n"
-                            "Continue with a mesh-only FBX export (no armature, "
-                            "no skin weights)?"
-                        ),
+                    action = self._prompt_skeleton_missing(
+                        entry.path, rig_prefix or "", pab_search_reason,
                     )
-                    if not proceed:
-                        self._progress.set_status("Export cancelled — skeleton missing.")
+                    if action == "cancel":
+                        self._progress.set_status(
+                            "Export cancelled — skeleton missing."
+                        )
                         return
+                    if action == "browse":
+                        # Re-run resolution with the user's picked path.
+                        override_path = self._pick_skeleton_from_vfs(rig_prefix or "")
+                        if override_path:
+                            from core.skeleton_resolver import (
+                                VfsManagerAdapter,
+                                resolve_skeleton,
+                            )
+                            adapter = VfsManagerAdapter(self._vfs)
+                            resolution = resolve_skeleton(
+                                entry.path, adapter,
+                                manual_override=override_path,
+                            )
+                            if resolution.skeleton is not None:
+                                # Remember the choice per rig class.
+                                if rig_prefix:
+                                    self._config.set(
+                                        f"explorer.skeleton_override.{rig_prefix}",
+                                        override_path,
+                                    )
+                                    self._config.save()
+                                skeleton = resolution.skeleton
+                                bone_count = len(skeleton.bones)
+                                from core.mesh_exporter import export_fbx_with_skeleton
+                                export_fbx_with_skeleton(
+                                    mesh, skeleton, output_dir, basename,
+                                )
+                                self._progress.set_status(
+                                    f"Exported FBX: {mesh.total_vertices:,} verts, "
+                                    f"{mesh.total_faces:,} faces, {bone_count} bones "
+                                    f"[rig={os.path.basename(override_path)}, source=manual]"
+                                )
+                                from ui.dialogs.confirmation import show_info
+                                show_info(
+                                    self, "Export Complete",
+                                    f"Exported {basename}.{fmt} to:\n{output_dir}\n\n"
+                                    f"Vertices: {mesh.total_vertices:,}\n"
+                                    f"Faces: {mesh.total_faces:,}\n"
+                                    f"Bones: {bone_count}\n"
+                                    f"Rig: {os.path.basename(override_path)} (manual)"
+                                )
+                                return
+                            else:
+                                from ui.dialogs.confirmation import show_error
+                                show_error(
+                                    self, "Skeleton load failed",
+                                    f"Could not load {override_path}:\n{resolution.reason}",
+                                )
+                                return
+                        # User cancelled the picker — treat as cancel.
+                        self._progress.set_status(
+                            "Export cancelled — skeleton missing."
+                        )
+                        return
+                    # action == "continue" — fall through to mesh-only.
                 from core.mesh_exporter import export_fbx
                 export_fbx(mesh, output_dir, basename)
                 self._progress.set_status(
@@ -1499,82 +1528,37 @@ class ExplorerTab(QWidget):
             show_error(self, "PAA parse failed", str(exc))
             return
 
-        # Attempt to find the paired skeleton. The PAA filename itself
-        # encodes the target rig via a well-known prefix:
-        #   cd_phm_*  → phm_01.pab   (player hero male, 178 bones)
-        #   cd_phw_*  → phw_01.pab   (player hero female)
-        #   cd_ptm_*  → ptm_01.pab   (trol/monster male, 169 bones)
-        #   cd_pgm_*  → pgm_01.pab   (goblin male)
-        #   cd_pgw_*  → pgw_01.pab   (goblin female)
-        #   cd_prh_*  → prh_01.pab   (player ride horse)
-        #   cd_rd_*   → rd_*.pab     (ride/mount variants)
-        #   cd_seq_*_phm1_* / phm* → phm
-        #   cd_seq_*_phw1_* / phw* → phw
-        # Until Apr 2026 the UI used "shortest filename" as the tiebreaker
-        # which picked ptm_01.pab for EVERY animation — that's why all
-        # Blender imports looked identical (wrong skeleton applied to
-        # every track).
+        # Delegate to the shared skeleton resolver. Character skeletons
+        # are shared at the class level (cd_phm_* → phm_01.pab etc.)
+        # and the resolver handles all 16 known rig prefixes plus
+        # manual per-class overrides saved in config.
+        from core.skeleton_resolver import (
+            VfsManagerAdapter,
+            detect_rig_prefix,
+            resolve_skeleton,
+        )
+
         skeleton: Skeleton | None = None
+        rig_prefix = detect_rig_prefix(entry.path)
+        manual_override = ""
+        if rig_prefix:
+            manual_override = self._config.get(
+                f"explorer.skeleton_override.{rig_prefix}", "",
+            )
+        adapter = VfsManagerAdapter(self._vfs)
         try:
-            grp = os.path.basename(os.path.dirname(entry.paz_file))
-            pamt = self._vfs.load_pamt(grp)
-            paa_name = os.path.basename(entry.path).lower()
-            # Detect the rig prefix from the PAA filename.
-            rig_prefix = None
-            # Order matters — more-specific patterns first.
-            rig_patterns = [
-                ("phm", ("cd_phm_", "_phm_", "_phm1_", "_phm2_", "_phm3_", "_phm8_")),
-                ("phw", ("cd_phw_", "_phw_", "_phw1_", "_phw2_", "_phw3_", "_phw8_")),
-                ("ptm", ("cd_ptm_", "_ptm_", "_ptm1_")),
-                ("ptw", ("cd_ptw_", "_ptw_")),
-                ("pgm", ("cd_pgm_", "_pgm_", "_pgm1_")),
-                ("pgw", ("cd_pgw_", "_pgw_")),
-                ("prh", ("cd_prh_", "_prh_", "cd_rd_prh_")),
-                ("nhm", ("nhm_",)),
-                ("nhw", ("nhw_",)),
-                ("ngm", ("cd_ngm_", "_ngm_")),
-            ]
-            for prefix, patterns in rig_patterns:
-                if any(pat in paa_name for pat in patterns):
-                    rig_prefix = prefix
-                    break
-            # All PABs in the same group + root 'character/' dir.
-            all_pabs = [
-                e.path.replace("\\", "/")
-                for e in pamt.file_entries
-                if e.path.lower().endswith(".pab")
-            ]
-            candidates: list[str] = []
-            if rig_prefix:
-                # Prefer rigs starting with the detected prefix (e.g. 'phm_01.pab').
-                prefixed = [p for p in all_pabs
-                            if os.path.basename(p).lower().startswith(rig_prefix + "_")]
-                # Within rig family, prefer the shortest (base) rig.
-                prefixed.sort(key=lambda p: (len(os.path.basename(p)), p))
-                candidates.extend(prefixed)
-            # Fallback chain: same dir, then shortest pab overall.
-            base_dir = os.path.dirname(entry.path.replace("\\", "/"))
-            dir_pabs = [p for p in all_pabs if p.startswith(base_dir + "/")]
-            dir_pabs.sort(key=len)
-            candidates.extend(dir_pabs)
-            # De-dup preserving order.
-            seen = set()
-            ordered = []
-            for c in candidates:
-                if c not in seen:
-                    seen.add(c); ordered.append(c)
-            for cand in ordered[:1]:
-                pab_entry = next(
-                    e for e in pamt.file_entries
-                    if e.path.replace("\\", "/") == cand
-                )
-                pab_bytes = self._vfs.read_entry_data(pab_entry)
-                skeleton = parse_pab(pab_bytes, os.path.basename(cand))
+            resolution = resolve_skeleton(
+                entry.path, adapter,
+                manual_override=manual_override or None,
+            )
+            if resolution.skeleton is not None:
+                skeleton = resolution.skeleton
                 logger.info(
-                    "PAA->FBX skeleton matched: rig=%s, file=%s",
-                    rig_prefix or "?", os.path.basename(cand),
+                    "PAA->FBX skeleton matched: rig=%s, file=%s, source=%s",
+                    rig_prefix or "?",
+                    os.path.basename(resolution.pab_path),
+                    resolution.source,
                 )
-                break
         except Exception as exc:
             logger.debug("PAA->FBX skeleton lookup failed: %s", exc)
 
@@ -1601,6 +1585,130 @@ class ExplorerTab(QWidget):
             )
         except Exception as exc:
             show_error(self, "FBX export failed", str(exc))
+
+    # ─── Shared helpers for FBX-with-skeleton flows ─────────────────
+
+    def _prompt_skeleton_missing(
+        self, asset_path: str, rig_prefix: str, reason: str,
+    ) -> str:
+        """Three-choice dialog shown when skeleton auto-resolve failed.
+
+        Returns one of:
+          * ``"browse"``   — user clicked "Browse for .pab..."
+          * ``"continue"`` — user accepted a mesh-only (no armature) export
+          * ``"cancel"``   — user cancelled the whole export
+
+        The ``rig_prefix`` (if non-empty) is surfaced in the dialog so
+        the user knows what family of asset they're dealing with
+        (``phm`` = male hero, ``phw`` = female hero, etc.).
+        """
+        from PySide6.QtWidgets import QMessageBox
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Skeleton not found")
+        header = f"No matching .pab skeleton was found for {os.path.basename(asset_path)}."
+        if rig_prefix:
+            header += (
+                f"\n\nDetected rig family: '{rig_prefix}' "
+                f"(expected something like {rig_prefix}_01.pab)."
+            )
+        box.setText(header)
+        box.setInformativeText(
+            f"Reason: {reason}\n\n"
+            "Choose what to do:\n\n"
+            "  • Browse for .pab... — pick a rig file by hand "
+            "(remembered for future exports of this class).\n"
+            "  • Continue — export a mesh-only FBX (no armature, no skin weights).\n"
+            "  • Cancel — abort the export."
+        )
+        browse_btn = box.addButton("Browse for .pab...", QMessageBox.ActionRole)
+        continue_btn = box.addButton("Continue", QMessageBox.AcceptRole)
+        cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(browse_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is browse_btn:
+            return "browse"
+        if clicked is continue_btn:
+            return "continue"
+        return "cancel"
+
+    def _pick_skeleton_from_vfs(self, rig_prefix: str = "") -> str:
+        """Open a file-picker dialog showing every .pab in the VFS.
+
+        When ``rig_prefix`` is supplied, the dialog pre-scrolls to
+        the best-guess candidates (by the same ranking algorithm
+        the auto-resolver uses). Returns the chosen VFS path, or
+        empty string when the user cancelled.
+        """
+        from PySide6.QtWidgets import (
+            QDialog, QDialogButtonBox, QLabel, QLineEdit, QListWidget,
+            QListWidgetItem, QVBoxLayout,
+        )
+        from core.skeleton_resolver import (
+            VfsManagerAdapter,
+            rank_skeleton_candidates,
+        )
+
+        adapter = VfsManagerAdapter(self._vfs)
+        all_pabs = adapter.list_pab_paths()
+        if not all_pabs:
+            from ui.dialogs.confirmation import show_error
+            show_error(
+                self, "No .pab files",
+                "No .pab skeleton files are visible through the VFS. "
+                "Load the game archives that contain the shared "
+                "character rigs before retrying.",
+            )
+            return ""
+
+        ordered = rank_skeleton_candidates(rig_prefix or None, all_pabs)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Pick a skeleton (.pab)")
+        dialog.setMinimumSize(640, 480)
+        layout = QVBoxLayout(dialog)
+
+        hint = QLabel(
+            f"Rig family detected: '{rig_prefix}'" if rig_prefix
+            else "No rig family detected — every .pab in the VFS listed below."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        search = QLineEdit()
+        search.setPlaceholderText("Filter by name or path...")
+        layout.addWidget(search)
+
+        listw = QListWidget()
+        for path in ordered:
+            item = QListWidgetItem(path)
+            listw.addItem(item)
+        if listw.count() > 0:
+            listw.setCurrentRow(0)
+        layout.addWidget(listw)
+
+        def _apply_filter():
+            text = search.text().strip().lower()
+            for i in range(listw.count()):
+                item = listw.item(i)
+                item.setHidden(bool(text) and text not in item.text().lower())
+        search.textChanged.connect(_apply_filter)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return ""
+        current = listw.currentItem()
+        if current is None:
+            return ""
+        return current.text()
 
     def _dump_hkx_json(self, entry: PamtFileEntry):
         """Dump an HKX to JSON using the Layer 5 HkxDocument facade."""

@@ -17,11 +17,23 @@ VERSION BUMPING RULES
 __all__ = ["APP_VERSION", "APP_NAME", "CHANGELOG"]
 
 APP_NAME = "CrimsonForge"
-APP_VERSION = "1.22.3"
+APP_VERSION = "1.22.4"
 
 # Each entry: (version, date, list_of_changes)
 # Newest first. `date` is YYYY-MM-DD.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
+    (
+        "1.22.4", "2026-04-22", [
+            "[Fix] FBX export of character meshes (cd_phm_*, cd_phw_*, cd_ppdm_*, cd_pgm_*, cd_pfm_*, etc.) now correctly finds the shared class-level skeleton. Previously the mesh export path used a sibling/basename search that was guaranteed to miss for character PACs (they share phm_01.pab / phw_01.pab / ppdm_01.pab class rigs, not per-mesh PABs). Root cause of the reported 'no armature in exported FBX' bug.",
+            "[Feature] New core/skeleton_resolver.py — single source of truth for mapping a PAC/PAA asset path to its shared rig. Knows all 16 known rig prefixes (phm, phw, ptm, ptw, pfm, pfw, ppdm, ppdw, pgm, pgw, prh, nhm, nhw, ngm, ngw, rd). Used by both the mesh FBX export and the animation FBX export paths for consistency.",
+            "[Feature] Manual 'Browse for .pab...' fallback when auto-resolve misses. The picker opens a filterable list of every PAB visible through the VFS, sorted by prefix-match first. User's choice is saved per rig class in config so future exports of the same character class skip the dialog automatically.",
+            "[Feature] New core/crash_handler.py — diagnostic layer for silent early-boot failures. faulthandler.enable() captures native C-level crashes (access violations, DLL load failures). sys.excepthook captures uncaught Python exceptions. Windows ctypes MessageBoxW provides a native dialog fallback when Qt itself is what failed to initialise. Next time the exe exits silently we will have a full traceback in the log instead of guessing.",
+            "[Fix] main.py now wraps QApplication(sys.argv) in try/except that surfaces a clear error message when Qt fails to initialise — typically after a hard reboot corrupted the PyInstaller extraction (%TEMP%\\_MEI*) or when VC++ 2015-2022 redistributable is missing.",
+            "[Feature] New core/mesh_preflight.py — pre-flight memory check that warns before starting a mesh repack when available RAM is below the projected peak. Uses psutil primary path + Windows GlobalMemoryStatusEx fallback. Prevents the 'whole system drops to 1 FPS' symptom when Forge + Blender + JMM + JMM Creator are all open at once.",
+            "[Performance] build_pac() in core/mesh_importer.py replaces a full copy.deepcopy(mesh) with a shallow wrapper copy + fresh submesh list. On a 20k-vertex character mesh the deepcopy walked every vertex/face/uv/normal tuple — hundreds of megabytes of allocation. Shallow copy is O(n_submeshes) instead.",
+            "[Test] 508 test scenarios across the v1.22.4 changes: 179 for the skeleton resolver (every prefix, ranking rules, VFS integration, manual override), 33 for crash diagnostics (install/reset/excepthook/message-box fallback), 37 for the pre-flight memory check (estimator, probe chain, decision matrix), 34 for the OBJ sidecar round-trip, 29 for vertex-split propagation + shallow-copy regression, 109 for checksum engine, 87 for file type detection.",
+        ],
+    ),
     (
         "1.22.3", "2026-04-21", [
             "[Fix] OBJ re-import no longer loses skin weights on UV-seam vertices. When Blender splits a vertex for multiple UV/normal corners, the clone now inherits its source slot's bone indices and bone weights. Root cause of the reported 'model exploded after import' symptom.",
