@@ -63,6 +63,15 @@ EXTENSION_MAP = {
     ".pam":     FileTypeInfo("mesh", "model/x-pam", "PAM Static Mesh", ".pam", True, False),
     ".pamlod":  FileTypeInfo("mesh", "model/x-pamlod", "PAM LOD Mesh", ".pamlod", True, False),
     ".pac":     FileTypeInfo("mesh", "model/x-pac", "PAC Skinned Mesh", ".pac", True, False),
+    # Post-April-2026 renamed extensions (were .pac.xml / .app.xml /
+    # .prefabdata.xml before the game patch). These are ChaCha20-
+    # encrypted XML sidecars carrying per-mesh material data,
+    # character appearance metadata, and supplementary prefab data
+    # respectively. can_edit=True so they get an "Edit" action in
+    # the Explorer context menu.
+    ".pac_xml": FileTypeInfo("text", "application/xml", "PAC XML (mesh properties)", ".pac_xml", True, True),
+    ".app_xml": FileTypeInfo("text", "application/xml", "App XML (appearance)", ".app_xml", True, True),
+    ".prefabdata_xml": FileTypeInfo("text", "application/xml", "Prefab Data XML", ".prefabdata_xml", True, True),
     ".pami":    FileTypeInfo("text", "application/xml", "Mesh Instance XML (encrypted)", ".pami", True, True),
     ".meshinfo": FileTypeInfo("binary", "application/x-meshinfo", "Mesh Info", ".meshinfo", False, False),
     # Havok Physics / Animation
@@ -239,6 +248,12 @@ def get_syntax_type(path: str) -> str:
         ".html": "html",
         ".thtml": "html",
         ".xml": "xml",
+        # April-2026 game patch renamed .foo.xml -> .foo_xml. Route
+        # all three to the xml highlighter so the preview pane shows
+        # proper syntax colouring for them.
+        ".pac_xml": "xml",
+        ".app_xml": "xml",
+        ".prefabdata_xml": "xml",
         ".json": "json",
         ".paloc": "paloc",
         ".txt": "plain",

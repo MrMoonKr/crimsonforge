@@ -17,11 +17,23 @@ VERSION BUMPING RULES
 __all__ = ["APP_VERSION", "APP_NAME", "CHANGELOG"]
 
 APP_NAME = "CrimsonForge"
-APP_VERSION = "1.22.7"
+APP_VERSION = "1.22.8"
 
 # Each entry: (version, date, list_of_changes)
 # Newest first. `date` is YYYY-MM-DD.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
+    (
+        "1.22.8", "2026-04-24", [
+            "[Feature] New PAC XML editor — right-click any .pac_xml / .app_xml / .prefabdata_xml file in the Explorer and pick 'Edit PAC XML...' / 'Edit App XML...' / 'Edit Prefab Data XML'. A popup opens with every editable attribute + text node laid out as a searchable, filterable table (Path / Tag / Attribute / Value / Kind). Each row can be edited in place or via an editable details pane below the table; Save As writes to disk and Patch to Game re-serialises + re-compresses (LZ4) + re-encrypts (ChaCha20) + writes back into the live PAZ/PAMT/PAPGT chain with automatic backup.",
+            "[Feature] New core/pac_xml_parser.py — parse / apply_edits / serialize for the multi-root XML format Pearl Abyss uses (UTF-8 BOM, CRLF line endings, tab indentation). Byte-for-byte identical round-trip verified on 30 of 30 real shipping .pac_xml files against a live Steam install.",
+            "[Enhancement] Edit-state cell colouring in the dialog — red for rows with pending unsaved edits, green for rows saved or patched this session, subtle category tint (path / name / id / flag / version) for untouched rows. Re-editing a saved row reverts it to red; reverting drops back to the category tint. Colours are at ~40% opacity (category) or ~45% opacity (state) so text stays legible on dark themes.",
+            "[Enhancement] Wide inline editor via custom QStyledItemDelegate — Value cells open with a 500-px-minimum QLineEdit (clear-button, framed) so long texture paths like `character/texture/cd_phw_00_eyecovermaterial_0001_n.dds` fit comfortably without the user having to horizontally scroll a cramped default editor.",
+            "[Enhancement] Editable multi-line details pane at the bottom of the dialog, with an Apply-to-Row button + Revert-This-Row button. Primary editing surface for long or multi-line values; routes through the same setData path as the inline editor so red/green state colouring stays consistent.",
+            "[Enhancement] core/file_detector.py registers .pac_xml / .app_xml / .prefabdata_xml as editable text files with XML syntax highlighting, so they get syntax-highlighted XML in the preview pane + the standard Edit action in the tree.",
+            "[Enhancement] 34 new regression tests in tests/test_pac_xml_parser.py covering BOM handling, multi-root parsing, attribute + text enumeration, single + multi-attribute edits surviving round-trips, category classification, unknown-attr fallback, summary counts, dataclass shape, malformed XML handling, non-UTF-8 rejection.",
+            "[Enhancement] Full test suite now 468 tests + 136 subtests = 604 scenarios passing (was 570 in v1.22.7).",
+        ],
+    ),
     (
         "1.22.7", "2026-04-24", [
             "[Fix] Character catalog + mesh sidecars work again on the post-April-2026 game patch. Pearl Abyss renamed three compound extensions: .app.xml -> .app_xml, .pac.xml -> .pac_xml, .prefabdata.xml -> .prefabdata_xml. 5,579 .app_xml, 12,692 .pac_xml, and 2,591 .prefabdata_xml files now live in the archives with the new names. Our encryption-detection list only recognised the old names, so every one of those files came back as raw ChaCha20 ciphertext — character appearance XML parsed as 'not well-formed', mesh sidecar discovery quietly returned nothing, etc.",

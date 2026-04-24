@@ -911,6 +911,22 @@ class ExplorerTab(QWidget):
                     entry = click_row_data.entry
                     edit_act = menu.addAction("Edit Prefab")
                     edit_act.triggered.connect(lambda _=False, e=entry: self._edit_prefab(e))
+                elif file_ext in (".pac_xml", ".app_xml", ".prefabdata_xml"):
+                    # Post-April-2026 renamed encrypted XML sidecars.
+                    # All three share a common structure (multi-root
+                    # XML with BOM + CRLF + tab indent) so they route
+                    # through the same editor dialog.
+                    menu.addSeparator()
+                    entry = click_row_data.entry
+                    kind_label = {
+                        ".pac_xml":        "Edit PAC XML (mesh properties)",
+                        ".app_xml":        "Edit App XML (appearance)",
+                        ".prefabdata_xml": "Edit Prefab Data XML",
+                    }[file_ext]
+                    edit_act = menu.addAction(kind_label)
+                    edit_act.triggered.connect(
+                        lambda _=False, e=entry: self._edit_pac_xml(e)
+                    )
 
         menu.exec(self._view.viewport().mapToGlobal(pos))
 
@@ -1186,6 +1202,39 @@ class ExplorerTab(QWidget):
             dlg.exec()
         except Exception as e:
             show_error(self, "Prefab Editor Error", str(e))
+
+    def _edit_pac_xml(self, entry: PamtFileEntry):
+        """Open the PAC XML editor dialog for one of the three
+        post-April-2026 renamed encrypted XML sidecars:
+
+          * .pac_xml         — per-mesh material + submesh data
+          * .app_xml         — character appearance metadata
+          * .prefabdata_xml  — supplementary prefab data
+
+        They share the same file format (UTF-8 BOM, multi-root XML,
+        CRLF line endings, tab indentation) so a single editor
+        handles all three. The VFS decrypts + decompresses on read
+        and the RepackEngine re-applies both on Patch-to-Game.
+        """
+        try:
+            from ui.dialogs.pac_xml_editor_dialog import PacXmlEditorDialog
+            from core.pac_xml_parser import parse_pac_xml
+
+            self._progress.set_status(
+                f"Parsing {os.path.basename(entry.path)}..."
+            )
+            QApplication.processEvents()
+
+            data = self._vfs.read_entry_data(entry)
+            parsed = parse_pac_xml(data, entry.path)
+
+            dlg = PacXmlEditorDialog(parsed, entry, self._vfs, parent=self)
+            self._progress.set_status(
+                f"Opened PAC XML editor: {os.path.basename(entry.path)}"
+            )
+            dlg.exec()
+        except Exception as e:
+            show_error(self, "PAC XML Editor Error", str(e))
 
     def _open_quick_mod(self, table_name: str, patch: bool = True, search: str = ""):
         """Open a specific game data table by name from package 0008."""
