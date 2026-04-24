@@ -27,6 +27,7 @@ from PySide6.QtCore import Qt, QTimer
 from utils.config import ConfigManager
 from utils.platform_utils import auto_discover_game
 from core.vfs_manager import VfsManager
+from core.game_reload_service import GameReloadService, ReloadPayload
 from ai.provider_registry import ProviderRegistry
 from ui.themes.dark import DARK_THEME
 from ui.themes.light import LIGHT_THEME
@@ -104,6 +105,20 @@ class MainWindow(QMainWindow):
         # window.
         self._tabs_materialising: set[int] = set()
 
+        # Game reload coordinator — knows how to refresh every
+        # registered tab's cached game state without closing the
+        # app. Seeded here with zero-arg stubs; the real paloc /
+        # version discovery callbacks are bound on first game load.
+        self._reload_service = GameReloadService()
+        # Poll timer for staleness detection (file-watcher style).
+        self._staleness_timer = QTimer(self)
+        self._staleness_timer.setInterval(4000)   # 4 s — cheap stats
+        self._staleness_timer.timeout.connect(self._check_game_staleness)
+        # True once we've warned the user the on-disk state drifted.
+        # Prevents the staleness banner from pinging the user every
+        # 4 seconds after they dismiss it.
+        self._staleness_banner_shown = False
+
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} - Crimson Desert Modding Studio")
         self.setMinimumSize(1100, 700)
         self.resize(1400, 850)
@@ -143,7 +158,38 @@ class MainWindow(QMainWindow):
         self._game_version_label = QLabel("")
         self._game_version_label.setStyleSheet("font-size: 11px; color: #a6adc8; padding: 0 8px;")
         self._files_label = QLabel("Files: 0")
+        # Staleness indicator — invisible until the file watcher
+        # detects the game files have changed on disk. When shown,
+        # it sits right next to the Reload Game button so the user
+        # sees the cause + the cure in one glance.
+        self._stale_badge = QLabel("")
+        self._stale_badge.setToolTip(
+            "Game files on disk have changed since you loaded them.\n"
+            "Click 'Reload Game' to refresh every tab's view."
+        )
+        self._stale_badge.setStyleSheet(
+            "font-size: 11px; font-weight: 600; "
+            "color: #f9e2af; background: #1e1e2e; "
+            "border: 1px solid #45475a; border-radius: 4px; "
+            "padding: 1px 8px;"
+        )
+        self._stale_badge.hide()
+        # Reload Game button — fan-out refresh for every tab.
+        # Disabled until a game is actually loaded (can't reload
+        # what you haven't loaded).
+        self._reload_btn = QPushButton("Reload Game")
+        self._reload_btn.setObjectName("warning")
+        self._reload_btn.setToolTip(
+            "Re-scan game archives and refresh every tab.\n"
+            "Use after patching, after Steam Verify, or whenever you\n"
+            "edit files outside CrimsonForge. No app restart needed."
+        )
+        self._reload_btn.setEnabled(False)
+        self._reload_btn.clicked.connect(self._reload_game)
+
         status_bar.addWidget(self._status_label, 1)
+        status_bar.addPermanentWidget(self._stale_badge)
+        status_bar.addPermanentWidget(self._reload_btn)
         status_bar.addPermanentWidget(self._game_version_label)
         status_bar.addPermanentWidget(self._files_label)
         self.setStatusBar(status_bar)
@@ -737,12 +783,36 @@ class MainWindow(QMainWindow):
             self._packages_path = result["packages_path"]
             groups = self._all_groups
 
+            # Wire the reload service to the freshly loaded VFS + the
+            # background-thread helpers it needs on future reloads.
+            # Binding here captures the initial disk fingerprint so
+            # :meth:`GameReloadService.is_stale` returns False
+            # immediately after load.
+            self._reload_service = GameReloadService(
+                vfs=self._vfs,
+                discover_palocs=lambda v: self._scan_paloc_files_parallel(
+                    v, v.list_package_groups(), lambda *_: None,
+                ),
+                read_game_version=lambda p: self._detect_game_version(str(p)),
+            )
+            self._reload_service.bind_vfs(self._vfs)
+            self._reload_btn.setEnabled(True)
+            # Start the staleness poll now — cheap stat calls every
+            # 4 seconds. Stops automatically when app closes.
+            self._staleness_timer.start()
+            self._staleness_banner_shown = False
+            self._stale_badge.hide()
+
             # ---- Initialise only the Explorer tab eagerly (it's the landing tab) ----
             self._show_loading_screen("Loading Crimson Desert...", "Building the Explorer file index.", 55)
             explorer = self._materialise_tab(1)
             explorer.initialize_from_game(self._vfs, groups)
             explorer.files_extracted.connect(self._on_files_extracted)
             explorer._game_initialized = True
+            # Explorer is eagerly initialised → register for reload
+            # immediately. Every other tab registers when it first
+            # materialises (see _register_tab_reload_hook).
+            self._register_tab_reload_hook(1, explorer)
 
             # ---- All other tabs initialise lazily on first click ----
             self._show_loading_screen("Loading Crimson Desert...", "Finalising.", 90)
@@ -896,6 +966,12 @@ class MainWindow(QMainWindow):
             container.show_content()
         self._tab_init_state[index] = "ready"
         self._tab_workers.pop(index, None)
+        # Register for reload fan-out now that this tab has real
+        # game state attached. Explorer is registered earlier (in
+        # _on_load_finished) because it inits eagerly.
+        widget = self._real_tabs.get(index)
+        if widget is not None:
+            self._register_tab_reload_hook(index, widget)
         logger.info(
             "Tab %d (%s) initialised asynchronously.",
             index, _TAB_REGISTRY[index]["label"],
@@ -914,6 +990,132 @@ class MainWindow(QMainWindow):
         self._tab_init_state[index] = "error"
         self._tab_workers.pop(index, None)
         logger.error("Tab %d (%s) init failed: %s", index, label, err)
+
+    # ------------------------------------------------------------------
+    # Reload-game machinery
+    # ------------------------------------------------------------------
+    # These hooks let every tab refresh itself when the user clicks
+    # "Reload Game" or the file watcher detects disk drift, WITHOUT
+    # the user having to close + reopen the app (which drops every
+    # in-flight project, selection, open dialog, …).
+    #
+    # A tab participates by either:
+    #
+    #   (a) implementing ``reload_from_game(payload)`` — preferred,
+    #       lets the tab preserve user work (selections, project,
+    #       scroll position) while refreshing game state;
+    #
+    #   (b) not implementing it — the tab's init state is demoted
+    #       so the next click re-runs ``initialize_from_game`` from
+    #       the fresh VFS. User loses per-tab state but that's the
+    #       cost of not implementing (a).
+    # ------------------------------------------------------------------
+    def _register_tab_reload_hook(self, index: int, widget: QWidget) -> None:
+        """Wire a tab up to the GameReloadService.
+
+        Called once per tab, right after first successful
+        initialisation, so the reload service knows how to refresh
+        that tab later. Safe to call multiple times — duplicate
+        registrations are harmless (the service just invokes the
+        callback twice on reload, which for correctly-idempotent
+        callbacks is still a no-op).
+        """
+        label = _TAB_REGISTRY[index]["label"]
+
+        def _reload_callback(payload: ReloadPayload) -> None:
+            # Preferred: the tab implements reload_from_game. If it
+            # doesn't, we demote its init state so the next click
+            # re-runs initialize_from_game against the fresh VFS.
+            reloader = getattr(widget, "reload_from_game", None)
+            if callable(reloader):
+                try:
+                    reloader(payload)
+                    return
+                except Exception as exc:
+                    logger.exception(
+                        "Tab %d (%s) reload_from_game failed: %s",
+                        index, label, exc,
+                    )
+            # Fallback: demote init state + clear the "already
+            # initialised" guard flag so the tab re-inits when the
+            # user next opens it.
+            self._tab_init_state.pop(index, None)
+            if hasattr(widget, "_game_initialized"):
+                try:
+                    delattr(widget, "_game_initialized")
+                except AttributeError:
+                    pass
+
+        self._reload_service.register_tab(label, _reload_callback)
+
+    def _reload_game(self) -> None:
+        """Refresh every tab's game-state cache from disk.
+
+        Blocks the UI briefly (a full reload reads every PAMT in
+        the packages directory). A loading overlay could be added
+        later if real users find the freeze noticeable.
+        """
+        if not self._game_loaded or self._reload_service.vfs is None:
+            return
+
+        self._reload_btn.setEnabled(False)
+        self._status_label.setText("Reloading game files...")
+        QApplication.processEvents()
+
+        try:
+            payload = self._reload_service.reload(
+                on_progress=lambda msg: self._status_label.setText(msg),
+            )
+            # Main window's own caches mirror the fresh payload so
+            # any lazy tab that inits AFTER the reload also uses
+            # the refreshed state.
+            self._vfs = payload.vfs
+            self._all_groups = payload.groups
+            self._discovered_palocs = payload.discovered_palocs
+            self._game_version = payload.game_version
+            self._game_version_label.setText(f"Game: {payload.game_version}")
+            self._files_label.setText(
+                f"Groups: {len(payload.groups)} | "
+                f"Languages: {len(payload.discovered_palocs)}"
+            )
+            self._status_label.setText(
+                f"Reload complete: {len(payload.groups)} package groups, "
+                f"{len(payload.discovered_palocs)} localization files."
+            )
+            self._stale_badge.hide()
+            self._staleness_banner_shown = False
+        except Exception as exc:
+            logger.exception("Reload failed: %s", exc)
+            self._status_label.setText(f"Reload failed: {exc}")
+            show_error(self, "Reload Error", str(exc))
+        finally:
+            self._reload_btn.setEnabled(True)
+
+    def _check_game_staleness(self) -> None:
+        """Timer slot — poll the disk for changes + flip the badge.
+
+        Runs every 4 seconds while the app is open + a game is
+        loaded. Just runs :meth:`GameReloadService.is_stale` which
+        is ~30 stat calls — cheap even on an HDD.
+
+        We show the badge only once per drift event (driven by
+        ``_staleness_banner_shown``) so users who deliberately edit
+        files outside CrimsonForge don't get nagged every 4 s.
+        """
+        if not self._game_loaded or self._reload_service.vfs is None:
+            return
+        try:
+            if self._reload_service.is_stale():
+                if not self._staleness_banner_shown:
+                    self._stale_badge.setText("Game files changed on disk")
+                    self._stale_badge.show()
+                    self._staleness_banner_shown = True
+            else:
+                if self._staleness_banner_shown:
+                    self._stale_badge.hide()
+                    self._staleness_banner_shown = False
+        except Exception as exc:   # pragma: no cover - defensive
+            logger.debug("Staleness check failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Misc

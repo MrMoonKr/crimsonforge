@@ -190,6 +190,23 @@ class TranslateTab(QWidget):
         self._stop_btn.clicked.connect(self._stop_translate)
         self._stop_btn.setEnabled(False)
         ctrl_row.addWidget(self._stop_btn)
+        # Scan Placeholders — post-translation QA. Detects broken
+        # placeholder tokens (missing / altered / leaked sentinel /
+        # extra) and offers surgical auto-fixes that never touch
+        # translated prose outside the broken region.
+        self._scan_btn = QPushButton("Scan Placeholders")
+        self._scan_btn.setObjectName("warning")
+        self._scan_btn.setToolTip(
+            "Scan every translated entry for broken placeholder tokens:\n"
+            "  * missing tokens the source had\n"
+            "  * altered namespaces that should match the source\n"
+            "  * leaked tokenizer sentinels from the AI round-trip\n"
+            "  * extra tokens the AI invented\n\n"
+            "The results dialog lets you apply safe, surgical fixes "
+            "one entry at a time or in bulk."
+        )
+        self._scan_btn.clicked.connect(self._scan_placeholders)
+        ctrl_row.addWidget(self._scan_btn)
         ctrl_row.addStretch()
         self._batch_progress_label = QLabel("")
         self._batch_progress_label.setToolTip("Real-time progress of the running batch translation.")
@@ -519,6 +536,71 @@ class TranslateTab(QWidget):
         self._update_game_header()
         self._update_sync_summary_label()
         self._progress.set_status(f"Game loaded: {count} localization files found")
+
+    def reload_from_game(self, payload) -> None:
+        """Refresh game-state caches without dropping the open project.
+
+        Called by :class:`core.game_reload_service.GameReloadService`
+        on a Reload Game event. We carefully avoid rebuilding or
+        clearing ``self._project`` because the user's in-flight
+        translations, status changes, notes and autosave-pending
+        edits live there — losing them on a reload would be a
+        user-hostile regression.
+
+        The language comboboxes and paloc list ARE rebuilt so a
+        newly-added language (e.g. Steam released Indonesian) is
+        visible after reload without a full app restart.
+        """
+        # Capture the current source selection so we can try to
+        # restore it after the combo rebuild.
+        prev_source_data = self._source_combo.currentData()
+
+        self._vfs = payload.vfs
+        self._usage_index = LocalizationUsageIndex(self._vfs)
+        self._packages_path = self._vfs._packages_path
+        self._discovered_palocs = [
+            paloc_info
+            for paloc_info in payload.discovered_palocs
+            if paloc_info.get("lang_code") != "ar"
+        ]
+
+        blocker = QSignalBlocker(self._source_combo)
+        self._source_combo.clear()
+        restore_index = -1
+        for i, paloc_info in enumerate(self._discovered_palocs):
+            lang_code = paloc_info["lang_code"]
+            lang = self._lang_config.get_language(lang_code)
+            display_name = lang.name if lang else lang_code
+            self._source_combo.addItem(
+                f"{display_name} ({paloc_info['filename']})",
+                paloc_info,
+            )
+            # Try to restore the previous selection by lang_code
+            # + filename match (paloc_info dicts from fresh scan
+            # are new objects so identity comparison fails).
+            if (
+                isinstance(prev_source_data, dict)
+                and paloc_info.get("lang_code") == prev_source_data.get("lang_code")
+                and paloc_info.get("filename") == prev_source_data.get("filename")
+            ):
+                restore_index = i
+        if restore_index >= 0:
+            self._source_combo.setCurrentIndex(restore_index)
+        del blocker
+
+        count = len(self._discovered_palocs)
+        build_info = self._get_game_build_info()
+        if build_info["short_label"]:
+            self._paloc_info.setText(
+                f"{count} game languages detected | {build_info['short_label']}"
+            )
+        else:
+            self._paloc_info.setText(f"{count} game languages detected")
+        self._update_game_header()
+        self._update_sync_summary_label()
+        self._progress.set_status(
+            f"Game reloaded: {count} localization files"
+        )
 
     def _get_game_build_info(self) -> dict:
         """Get the current game build metadata from 0.paver + 0.papgt."""
@@ -973,6 +1055,75 @@ class TranslateTab(QWidget):
     def _stop_translate(self):
         if self._batch_processor:
             self._batch_processor.stop()
+
+    def _scan_placeholders(self):
+        """Open the placeholder-scan QA dialog.
+
+        Scans every translated entry for broken placeholder tokens
+        (missing / altered / leaked sentinel / extra) and lets the
+        user apply surgical auto-fixes. The dialog is non-modal so
+        the main translation table stays visible.
+
+        Empty project = friendly message, no dialog spawn.
+        """
+        from ui.dialogs.placeholder_scan_dialog import PlaceholderScanDialog
+
+        if not self._project or not self._project.entries:
+            show_info(
+                self, "Scan Placeholders",
+                "No translation project loaded. Load a language first, "
+                "then run the scan after translating some entries."
+            )
+            return
+
+        translated_count = sum(
+            1 for e in self._project.entries if e.translated_text
+        )
+        if translated_count == 0:
+            show_info(
+                self, "Scan Placeholders",
+                "No translated entries yet. Run 'Auto Translate All' or "
+                "enter translations manually before scanning."
+            )
+            return
+
+        def _apply_fix(entry_index: int, new_text: str) -> None:
+            """Apply a scanner auto-fix to one entry.
+
+            Mirrors the path taken by direct cell edits in the main
+            table: mutate the entry, flag the project modified,
+            notify autosave, and refresh stats. A batched reload of
+            the table widget is done once after the dialog finishes
+            (see fixes_applied signal below) so we don't pay the
+            full rebuild cost per fix.
+            """
+            entry = self._project.get_entry(entry_index)
+            if entry is None:
+                return
+            entry.edit_translation(new_text)
+            if new_text and entry.status == StringStatus.PENDING:
+                entry.status = StringStatus.TRANSLATED
+            self._project.mark_modified()
+
+        dlg = PlaceholderScanDialog(
+            entries=list(self._project.entries),
+            apply_fix=_apply_fix,
+            parent=self,
+        )
+        dlg.fixes_applied.connect(self._on_placeholder_fixes_applied)
+        dlg.show()
+
+    def _on_placeholder_fixes_applied(self, n_fixes: int) -> None:
+        """Called by the scan dialog after an auto-fix batch lands."""
+        self._autosave.notify_change()
+        self._update_stats()
+        # Refresh the main table so fixed translations render with
+        # their new text. Cheap — _reload_table rebuilds from the
+        # already-in-memory project entries.
+        self._reload_table()
+        self._progress.set_status(
+            f"Placeholder scan: {n_fixes} fix(es) applied."
+        )
 
     def _on_batch_done(self, results):
         self._auto_translate_btn.setEnabled(True)

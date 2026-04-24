@@ -317,6 +317,14 @@ class ExplorerTab(QWidget):
         self._current_edit_file = ""
         self._pending_mesh_data: dict[str, dict] = {}
         self._temp_dir = tempfile.mkdtemp(prefix="crimsonforge_preview_")
+        # Baseline manager — snapshots the original PAC bytes on
+        # first patch so every subsequent rebuild (preview, build-
+        # to-folder, patch-to-game, restore) starts from a stable,
+        # pre-modification source. This is what breaks the
+        # "patch twice = corrupted mesh" feedback loop described in
+        # the v1.22.9 bug report.
+        from core.mesh_baseline_manager import MeshBaselineManager
+        self._mesh_baseline = MeshBaselineManager()
         self._last_preview_path = ""
         self._last_preview_time = 0.0
         self._active_scope_title = ""
@@ -563,6 +571,50 @@ class ExplorerTab(QWidget):
         self._on_group_changed(ALL_PACKAGES)
         self._ensure_workbench_dialog().workbench.set_vfs(self._vfs)
         self._progress.set_status(f"Game loaded: {len(groups)} package groups")
+
+    def reload_from_game(self, payload) -> None:
+        """Refresh cached game state without dropping user selection.
+
+        Called by :class:`core.game_reload_service.GameReloadService`
+        when the user hits the Reload Game button. The key
+        difference from :meth:`initialize_from_game` is that we
+        try to KEEP the user's current package selection + any
+        active scope/filter/search — only the underlying VFS and
+        group list are replaced.
+
+        ``payload`` is a :class:`ReloadPayload` but we accept it
+        duck-typed so unit tests can pass a lightweight stand-in.
+        """
+        previous_group = self._group_combo.currentText()
+        self._vfs = payload.vfs
+        self._all_groups = list(payload.groups)
+        # Reset only the caches that derive from game state —
+        # the user's filter / search / scope stay in place.
+        self._item_index = None
+        self._prefab_ref_index = None
+        # Refresh the group combo, trying to restore the previous
+        # selection if it still exists in the new group set.
+        self._group_combo.blockSignals(True)
+        self._group_combo.clear()
+        self._group_combo.addItem(ALL_PACKAGES)
+        self._group_combo.addItems(self._all_groups)
+        restore = (
+            previous_group
+            if previous_group == ALL_PACKAGES
+            or previous_group in self._all_groups
+            else ALL_PACKAGES
+        )
+        self._group_combo.setCurrentText(restore)
+        self._group_combo.blockSignals(False)
+        # Rebuild the item-name index against the refreshed VFS.
+        self._load_item_index()
+        # Trigger a table refresh for the (possibly-restored) group.
+        self._on_group_changed(self._group_combo.currentText())
+        # Workbench dialog (if open) needs the fresh VFS too.
+        self._ensure_workbench_dialog().workbench.set_vfs(self._vfs)
+        self._progress.set_status(
+            f"Game reloaded: {len(self._all_groups)} package groups"
+        )
 
     def _load_item_index(self) -> None:
         """Build the item-name search index from live game data."""
@@ -825,10 +877,37 @@ class ExplorerTab(QWidget):
                     menu.addSeparator()
                     import_act = menu.addAction("Import OBJ (preview rebuilt mesh)")
                     import_act.triggered.connect(lambda _=False, e=entry: self._import_mesh(e))
+                    # NEW in v1.22.9 — build the rebuilt PAC to a
+                    # user folder without touching the live game
+                    # archives. Fast iteration loop for mesh work.
+                    build_act = menu.addAction("Build PAC to Folder... (no patch)")
+                    build_act.setToolTip(
+                        "Convert an OBJ to a .pac / .pam / .pamlod file on "
+                        "disk without modifying game archives. Ideal for "
+                        "iterating on mesh edits before committing."
+                    )
+                    build_act.triggered.connect(
+                        lambda _=False, e=entry: self._build_pac_to_folder(e)
+                    )
                     patch_act = menu.addAction("Import OBJ + Patch to Game")
                     patch_act.triggered.connect(lambda _=False, e=entry: self._import_and_patch_mesh(e))
                     ship_act = menu.addAction("Import OBJ + Ship to App")
                     ship_act.triggered.connect(lambda _=False, e=entry: self._ship_single_mesh(e))
+                    # NEW in v1.22.9 — one-click undo, no Steam
+                    # Verify needed. Only enabled when a baseline
+                    # snapshot exists for this PAC.
+                    if self._mesh_baseline.has_baseline(entry.path):
+                        menu.addSeparator()
+                        restore_act = menu.addAction(
+                            "Restore from Baseline (undo all edits)"
+                        )
+                        restore_act.setToolTip(
+                            "Patch the pristine, pre-edit bytes back into "
+                            "the game. No Steam Verify required."
+                        )
+                        restore_act.triggered.connect(
+                            lambda _=False, e=entry: self._restore_from_baseline(e)
+                        )
 
         # Animation (PAA) exports — FBX keyframe export for modders.
         if click_index.isValid():
@@ -1859,8 +1938,17 @@ class ExplorerTab(QWidget):
                 show_error(self, "Import Error", "No geometry found in OBJ file.")
                 return
 
-            # Read original data for rebuild
-            original_data = self._vfs.read_entry_data(entry)
+            # Read original data for rebuild.
+            # IMPORTANT — route through the baseline manager so the
+            # donor source is the PRISTINE PAC, not whatever is
+            # currently on disk. Prevents compound-corruption when
+            # this method (or the patch variant) is run more than
+            # once on the same PAC.
+            original_data = self._mesh_baseline.get_or_snapshot(
+                entry.path,
+                live_read=lambda: self._vfs.read_entry_data(entry),
+                source_paz=os.path.basename(entry.paz_file or ""),
+            )
 
             # Override source info from the target entry
             imported.path = entry.path
@@ -1924,8 +2012,19 @@ class ExplorerTab(QWidget):
                 show_error(self, "Import Error", "No geometry found in OBJ file.")
                 return
 
-            # Read original data
-            original_data = self._vfs.read_entry_data(entry)
+            # Read original data.
+            # IMPORTANT — route through the baseline manager so the
+            # donor source is the PRISTINE PAC captured the very
+            # first time this mesh was touched, not the live (and
+            # potentially already-patched) bytes. Without this
+            # safeguard, a second patch inherits tiny data drifts
+            # from the first and compounds them until the mesh in-
+            # game shatters.
+            original_data = self._mesh_baseline.get_or_snapshot(
+                entry.path,
+                live_read=lambda: self._vfs.read_entry_data(entry),
+                source_paz=os.path.basename(entry.paz_file or ""),
+            )
 
             # Set format from target entry
             imported.path = entry.path
@@ -1958,7 +2057,14 @@ class ExplorerTab(QWidget):
                 )
                 if paired_entry:
                     try:
-                        paired_original = self._vfs.read_entry_data(paired_entry)
+                        # Same baseline protection for the paired
+                        # LOD so the LOD pass is also idempotent
+                        # across repeat patches.
+                        paired_original = self._mesh_baseline.get_or_snapshot(
+                            paired_entry.path,
+                            live_read=lambda pe=paired_entry: self._vfs.read_entry_data(pe),
+                            source_paz=os.path.basename(paired_entry.paz_file or ""),
+                        )
                         paired_mesh = transfer_pam_edit_to_pamlod_mesh(
                             imported, original_data, paired_original, paired_entry.path
                         )
@@ -2019,6 +2125,15 @@ class ExplorerTab(QWidget):
                     f"Patched {entry.path}: {imported.total_vertices:,} verts, "
                     f"{imported.total_faces:,} faces"
                 )
+                # Invalidate the PAMT cache for the affected group
+                # so any subsequent read from this tab sees the
+                # refreshed file-entry offsets. The main window's
+                # periodic staleness poll will also notice the
+                # 0.pamt mtime change and show the reload badge.
+                try:
+                    self._vfs.invalidate_pamt_cache(paz_dir)
+                except Exception:
+                    pass
                 show_info(self, "Patch Complete",
                           f"Successfully patched {entry.path}\n\n"
                           f"Vertices: {imported.total_vertices:,}\n"
@@ -2035,6 +2150,200 @@ class ExplorerTab(QWidget):
             self._progress.set_status(f"Patch error: {e}")
             logger.error("Mesh patch error for %s: %s", entry.path, e)
             show_error(self, "Patch Error", str(e))
+
+    def _build_pac_to_folder(self, entry: PamtFileEntry):
+        """Convert an OBJ into a .pac / .pam / .pamlod file on disk
+        without touching the live game archives.
+
+        Workflow
+        --------
+        1. Prompt for the OBJ to import.
+        2. Prompt for an output folder.
+        3. Source donor vertex data from the baseline manager
+           (snapshotting the current live bytes on first call so
+           subsequent builds are idempotent).
+        4. Run the OBJ→binary rebuild.
+        5. Write the rebuilt file to ``<folder>/<basename>`` and
+           open the containing folder in Explorer.
+
+        Why this exists
+        ---------------
+        Mesh editing is trial-and-error: a user often iterates on
+        the OBJ several times before they're happy with the
+        result. Patching into game archives each iteration is slow
+        (the PAZ files are ~870 MB post-April-2026 patch and Bob
+        Jenkins Lookup3 is O(n)), risks the double-patch corruption
+        bug, and requires a Steam verify to recover from mistakes.
+
+        This action gives the user a safe, fast loop: build PAC,
+        inspect it (preview, open in external tool, diff), iterate,
+        THEN hit "Import OBJ + Patch to Game" once at the end.
+        """
+        from ui.dialogs.file_picker import pick_directory
+
+        obj_path = pick_file(
+            self, "Select OBJ File",
+            filters="OBJ Files (*.obj);;All Files (*.*)"
+        )
+        if not obj_path:
+            return
+
+        out_dir = pick_directory(self, "Select output folder for rebuilt PAC")
+        if not out_dir:
+            return
+
+        try:
+            self._progress.set_status(
+                f"Building {os.path.basename(entry.path)} from "
+                f"{os.path.basename(obj_path)}..."
+            )
+            from core.mesh_importer import import_obj, build_mesh
+            imported = import_obj(obj_path)
+            if not imported.submeshes:
+                show_error(self, "Import Error", "No geometry found in OBJ file.")
+                return
+
+            # Baseline-backed donor source (idempotent).
+            original_data = self._mesh_baseline.get_or_snapshot(
+                entry.path,
+                live_read=lambda: self._vfs.read_entry_data(entry),
+                source_paz=os.path.basename(entry.paz_file or ""),
+            )
+
+            imported.path = entry.path
+            ext = os.path.splitext(entry.path.lower())[1]
+            imported.format = (
+                "pac" if ext == ".pac"
+                else "pamlod" if ext == ".pamlod"
+                else "pam"
+            )
+
+            new_data = build_mesh(imported, original_data)
+
+            basename = os.path.basename(entry.path)
+            out_path = os.path.join(out_dir, basename)
+            with open(out_path, "wb") as f:
+                f.write(new_data)
+
+            # Stash as pending so the user can choose to patch
+            # later without re-running the build.
+            self._pending_mesh_data[entry.path.lower()] = {
+                "entry": entry,
+                "new_data": new_data,
+                "imported": imported,
+                "obj_path": obj_path,
+            }
+
+            self._progress.set_status(
+                f"Built {basename}: {imported.total_vertices:,} verts, "
+                f"{imported.total_faces:,} faces"
+            )
+            show_info(
+                self, "Build Complete",
+                f"Wrote {out_path}\n\n"
+                f"Vertices: {imported.total_vertices:,}\n"
+                f"Faces: {imported.total_faces:,}\n"
+                f"Submeshes: {len(imported.submeshes)}\n"
+                f"Size: {len(new_data):,} bytes\n\n"
+                f"Game archives were NOT modified. Use "
+                f"'Import OBJ + Patch to Game' when ready to apply.",
+            )
+
+            # Reveal in Explorer (Windows — best-effort, failure
+            # is not fatal).
+            try:
+                import subprocess
+                subprocess.Popen(["explorer.exe", "/select,", out_path])
+            except Exception:
+                pass
+
+        except Exception as e:
+            self._progress.set_status(f"Build error: {e}")
+            logger.error("Build PAC error for %s: %s", entry.path, e)
+            show_error(self, "Build Error", str(e))
+
+    def _restore_from_baseline(self, entry: PamtFileEntry):
+        """Patch the baseline (pristine) bytes back into the live
+        archive. One-click undo without Steam's Verify Integrity.
+
+        Only works if a baseline has been captured for this PAC —
+        i.e. the user has already run one of the import/build
+        actions on it. If no baseline exists, we tell the user to
+        run Steam Verify instead.
+        """
+        from core.repack_engine import RepackEngine, ModifiedFile
+
+        meta = self._mesh_baseline.get_meta(entry.path)
+        if meta is None:
+            show_info(
+                self, "No Baseline",
+                f"No baseline snapshot exists for {entry.path}.\n\n"
+                "A baseline is captured the first time you run 'Import OBJ' "
+                "or 'Import OBJ + Patch to Game'. Since none was taken for "
+                "this file, the only way to restore is:\n\n"
+                "  Steam → right-click Crimson Desert → Properties → "
+                "Installed Files → Verify integrity of game files",
+            )
+            return
+
+        baseline_bytes = self._mesh_baseline.get_bytes(entry.path, verify=True)
+        if baseline_bytes is None:
+            show_error(
+                self, "Baseline Corrupted",
+                f"The baseline snapshot for {entry.path} failed its "
+                "integrity check and cannot be used. Delete the baseline "
+                "(Tools → Clear Mesh Baselines), run Steam Verify to "
+                "restore the live archive, then re-import to capture a "
+                "fresh baseline.",
+            )
+            return
+
+        if not confirm_action(
+            self, "Restore from Baseline",
+            f"Restore {entry.path} to its pristine baseline?\n\n"
+            f"Baseline size: {meta.byte_size:,} bytes\n"
+            f"Captured: {time.strftime('%Y-%m-%d %H:%M', time.localtime(meta.snapshot_unix))}\n"
+            f"Source PAZ: {meta.source_paz}\n\n"
+            f"A backup of the current bytes will be created first.",
+        ):
+            return
+
+        try:
+            self._progress.set_status(f"Restoring {entry.path} from baseline...")
+            paz_dir = os.path.basename(os.path.dirname(entry.paz_file))
+            pamt_data = self._vfs.load_pamt(paz_dir)
+            game_path = os.path.dirname(os.path.dirname(entry.paz_file))
+            papgt_path = os.path.join(game_path, "meta", "0.papgt")
+
+            mod_file = ModifiedFile(
+                data=baseline_bytes,
+                entry=entry,
+                pamt_data=pamt_data,
+                package_group=paz_dir,
+            )
+            engine = RepackEngine(game_path)
+            result = engine.repack(
+                [mod_file], papgt_path=papgt_path,
+                create_backup=True, verify_after=True,
+            )
+            if result.success:
+                self._progress.set_status(
+                    f"Restored {entry.path} from baseline "
+                    f"({meta.byte_size:,} bytes)."
+                )
+                show_info(
+                    self, "Restored",
+                    f"{entry.path} is back to its original state.\n\n"
+                    f"Launch the game to verify.",
+                )
+            else:
+                err = "; ".join(result.errors) if result.errors else "Unknown failure."
+                show_error(self, "Restore Error", f"Repack failed: {err}")
+
+        except Exception as e:
+            self._progress.set_status(f"Restore error: {e}")
+            logger.error("Restore-from-baseline error for %s: %s", entry.path, e)
+            show_error(self, "Restore Error", str(e))
 
     def _open_archive_in_editor(self, entry: PamtFileEntry):
         try:

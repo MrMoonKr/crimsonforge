@@ -82,20 +82,66 @@ class TranslationEngine:
         model: str = "",
         context: str = "",
     ) -> TranslationResult:
-        """Translate a single string."""
+        """Translate a single string.
+
+        Protected-token pipeline
+        ------------------------
+        Pearl Abyss paloc strings contain non-prose placeholders
+        (``<br/>``, ``[EMPTY]``, ``%0``, ``{Key:...}``,
+        ``{Staticinfo:Knowledge:...#Korean_Label}``, etc.) that
+        MUST survive translation byte-for-byte. We round-trip
+        them through opaque sentinels so the AI can't mangle them:
+
+          1. Encode every protected token as ``⟦CFn⟧`` (or a
+             paired ``⟦CFn⟧label⟦/CFn⟧`` for hash-label braces
+             that contain a translatable Korean label).
+          2. Append a short preservation instruction to the
+             system prompt.
+          3. Send the encoded text + augmented prompt to the AI.
+          4. Decode the returned sentinels back to the original
+             tokens (for paired sentinels, the AI-translated
+             label stays put and we splice it back into the
+             namespace#label frame).
+
+        The result object stores the FINAL decoded translation,
+        so downstream consumers never see a sentinel.
+        """
+        from core.translation_tokenizer import (
+            PROMPT_INSTRUCTION,
+            decode_after_translation,
+            encode_for_translation,
+        )
+
         glossary = getattr(self, "_glossary_text", "")
         system_prompt = self._prompt_manager.get_system_prompt(
             source_lang, target_lang, glossary_text=glossary
         )
+        # Append the sentinel-preservation rule to whatever the
+        # prompt manager produced. One concise paragraph; the
+        # existing prompt stays intact.
+        system_prompt = system_prompt + "\n\n" + PROMPT_INSTRUCTION
+
+        encoded_text, token_table = encode_for_translation(text)
 
         result = self._provider.translate(
-            text=text,
+            text=encoded_text,
             source_lang=source_lang,
             target_lang=target_lang,
             model=model,
             system_prompt=system_prompt,
             context=context,
         )
+        # Restore the protected tokens in the translated string.
+        # Uses a tolerant matcher that handles minor sentinel
+        # noise the AI occasionally introduces (case changes,
+        # stray whitespace).
+        if result.success and result.translated_text:
+            result = result.__class__(**{
+                **result.__dict__,
+                "translated_text": decode_after_translation(
+                    result.translated_text, token_table,
+                ),
+            })
 
         with self._lock:
             self._stats.total_requests += 1

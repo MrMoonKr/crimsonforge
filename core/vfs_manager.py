@@ -113,13 +113,59 @@ class VfsManager:
 
     def invalidate_pamt_cache(self, group_dir: str):
         """Clear a group from the PAMT cache to force a reload from disk.
-        
-        Call this after repacking a group to ensure subsequent reads see 
+
+        Call this after repacking a group to ensure subsequent reads see
         the updated offsets and metadata.
         """
         if group_dir in self._pamt_cache:
             del self._pamt_cache[group_dir]
             logger.info("Invalidated PAMT cache for group: %s", group_dir)
+
+    def reload(self) -> None:
+        """Drop every cache and rebuild the VFS from the packages
+        directory.
+
+        Use after patching, after the user runs Steam's "Verify
+        Integrity of Game Files", or whenever the on-disk state
+        diverges from what this VfsManager currently has in memory.
+
+        After ``reload()``:
+
+          * ``_papgt_data`` is cleared (lazy-loaded on next call to
+            :meth:`load_papgt`)
+          * ``_pamt_cache`` is emptied so every group re-parses
+            from disk on next :meth:`load_pamt` call
+          * the VFS tree is rebuilt as empty and will re-populate
+            on demand the same way it does after construction
+          * processing-warning dedup set is cleared so any new
+            warnings surface once each
+
+        The packages directory itself is re-checked; if the user
+        uninstalled the game between loads, we raise a
+        FileNotFoundError the same as the constructor.
+
+        This method is intentionally cheap (microseconds) because
+        the heavy lifting still happens lazily on first access. It
+        does NOT pre-warm caches — callers that want eager reload
+        should iterate :meth:`list_package_groups` and call
+        :meth:`load_pamt` for each, exactly as the initial load
+        flow does.
+        """
+        if not self._packages_path.is_dir():
+            raise FileNotFoundError(
+                f"Packages directory disappeared during reload: "
+                f"{self._packages_path}. Re-select the game path."
+            )
+        prev_groups = len(self._pamt_cache)
+        self._papgt_data = None
+        self._pamt_cache.clear()
+        self._root = VfsNode(name="root", is_dir=True)
+        self._logged_processing_warnings.clear()
+        logger.info(
+            "VFS reload: cleared %d cached PAMT group(s); "
+            "caches will re-populate on next access.",
+            prev_groups,
+        )
 
     def extract_entry(
         self,
